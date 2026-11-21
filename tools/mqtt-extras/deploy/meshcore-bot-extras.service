@@ -1,0 +1,26 @@
+[Unit]
+Description=MeshCore bot extra commands over MQTT (zork, dadjoke)
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/meshcore-bot-extras/mqtt.env
+ExecStart=/usr/bin/node /opt/meshcore-bot-extras/extras.js --host ${MQTT_HOST} --port ${MQTT_PORT} --user ${MQTT_USER} --prefix ${MQTT_PREFIX} --saves /var/lib/meshcore-bot-extras/saves
+Restart=always
+RestartSec=5
+# Runs as its own throwaway user; the only place it can write is /var/lib/meshcore-bot-extras.
+DynamicUser=yes
+StateDirectory=meshcore-bot-extras
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=200M
+
+[Install]
+WantedBy=multi-user.target

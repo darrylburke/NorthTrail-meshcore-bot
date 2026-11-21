@@ -5,6 +5,9 @@
 #include <WiFi.h>
 #endif
 #include <Mesh.h>
+#ifdef WITH_BOT
+#include "BotTask.h"
+#endif
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -289,6 +292,9 @@ uint8_t MyMesh::getExtraAckTransmitCount() const {
 }
 
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+#ifdef WITH_BOT
+  bot_task.noteRawPacket(raw, len);
+#endif
   if (_serial->isConnected() && len + 3 <= MAX_FRAME_SIZE) {
     int i = 0;
     out_frame[i++] = PUSH_CODE_LOG_RX_DATA;
@@ -912,6 +918,10 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   memset(advert_paths, 0, sizeof(advert_paths));
   memset(send_scope.key, 0, sizeof(send_scope.key));
   send_unscoped = false;
+#ifdef WITH_BOT
+  _bot_cli_serial = false;
+  _bot_cli_discard = false;
+#endif
 
   // defaults
   _prefs.airtime_factor = 1.0;
@@ -980,6 +990,12 @@ void MyMesh::begin() {
   _store->loadPrefs(_prefs);
   sensors.node_lat = _prefs.node_lat;
   sensors.node_lon = _prefs.node_lon;
+#ifdef WITH_BOT
+  // An unattended bot must accept DMs from anyone it has heard: force auto-add on, and
+  // overwrite the oldest non-favourite contact when the table is full.
+  _prefs.manual_add_contacts &= ~1;
+  _prefs.autoadd_config |= AUTO_ADD_OVERWRITE_OLDEST;
+#endif
 
   // sanitise bad pref values
   _prefs.rx_delay_base = constrain(_prefs.rx_delay_base, 0, 20.0f);
@@ -2183,6 +2199,29 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
   }
 #endif
 
+#ifdef WITH_BOT
+  if (memcmp(command, "set bot.webpwd ", 15) == 0) {
+    // Only from the local serial reader (checkCLIRescueCmd), never the app or the remote CLI.
+    if (!_bot_cli_serial) {
+      strcpy(reply, "Error, serial only");
+      return true;
+    }
+    size_t n = strlen(&command[15]);
+    if (n < 8 || n > 63) {
+      strcpy(reply, "Error, password must be 8 to 63 characters");
+    } else if (bot_task.setWebPassword(&command[15])) {
+      strcpy(reply, "> bot web password set");
+    } else {
+      strcpy(reply, "Error, password not saved (it works until reboot)");
+    }
+    return true;
+  }
+  if (strcmp(command, "get bot.status") == 0) {
+    bot_task.formatStatus(reply, 160);   // the shortest caller's reply buffer (BaseChatMesh CLI reply) holds 161
+    return true;
+  }
+#endif
+
   if (strcmp(command, "board") == 0) {
     strcpy(reply, board.getManufacturerName());
     return true;
@@ -2213,6 +2252,14 @@ bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char*
 }
 
 void MyMesh::checkCLIRescueCmd() {
+#ifdef WITH_BOT
+  if (_bot_cli_discard) {   // drop the rest of an over-long "set bot.webpwd" line, unechoed
+    while (Serial.available()) {
+      if (Serial.read() == '\r') { _bot_cli_discard = false; break; }
+    }
+    if (_bot_cli_discard) return;
+  }
+#endif
   int len = strlen(cli_command);
   // `cli_command` must stay NUL-terminated within its bounds. If it ever isn't,
   // strlen() above can return >= sizeof(cli_command) and the loop below would
@@ -2229,6 +2276,16 @@ void MyMesh::checkCLIRescueCmd() {
     }
     Serial.print(c);  // echo
   }
+#ifdef WITH_BOT
+  // A "set bot.webpwd" line that overflowed the buffer must not be cut and accepted.
+  if (len == sizeof(cli_command)-1 && cli_command[len - 1] != '\r'
+      && memcmp(cli_command, "set bot.webpwd", 14) == 0) {
+    memset(cli_command, 0, sizeof(cli_command));
+    _bot_cli_discard = true;
+    Serial.println("  Error: line too long, password not set");
+    return;
+  }
+#endif
   if (len == sizeof(cli_command)-1) {  // buffer full: treat as a completed line
     cli_command[sizeof(cli_command)-2] = '\r';  // place end-of-line marker inside the buffer
     cli_command[sizeof(cli_command)-1] = 0;     // keep the buffer NUL-terminated
@@ -2238,7 +2295,16 @@ void MyMesh::checkCLIRescueCmd() {
     cli_command[len - 1] = 0;  // replace newline with C string null terminator
 
     reply_buf[0] = 0;
+#ifdef WITH_BOT
+    _bot_cli_serial = true;   // marks the call as coming from the local serial port
+    bool handled = handleCommand(cli_command, 0, reply_buf);
+    _bot_cli_serial = false;
+    // The line held a password: do not leave it in the buffer once handled.
+    if (memcmp(cli_command, "set bot.webpwd", 14) == 0) memset(cli_command, 0, sizeof(cli_command));
+    if (handled) {
+#else
     if (handleCommand(cli_command, 0, reply_buf)) {
+#endif
       // command was handled, print reply output
       Serial.print("  "); Serial.print(reply_buf); Serial.println();
     } else if (strcmp(cli_command, "rebuild") == 0) {
@@ -2426,6 +2492,12 @@ void MyMesh::loop() {
     // display + long-press), so serve config commands on the otherwise unused USB serial
     checkCLIRescueCmd();
 #endif
+#if defined(WITH_BOT) && !defined(ENABLE_USB_INTERFACE) && !defined(RP2040_PLATFORM)
+    // The bot build is headless too (no display, so no long-press into rescue mode): serve
+    // the config commands (set wifi.*, set bot.webpwd, get bot.status, ...) on USB serial.
+    // Accepted design decision: anyone with physical USB access gets this whole CLI.
+    checkCLIRescueCmd();
+#endif
   }
 
   // is there are pending dirty contacts write needed?
@@ -2449,6 +2521,140 @@ bool MyMesh::advert() {
     return false;
   }
 }
+
+#ifdef WITH_BOT
+bool MyMesh::botSendChannel(const char* channel_name, const char* text) {
+  if (!channel_name || !text) return false;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails ch;
+    if (!getChannel(i, ch) || ch.name[0] == 0 || strcmp(ch.name, channel_name) != 0) continue;
+    // Use the node's default scope, not whatever override the app last left in place.
+    TransportKey saved_scope = send_scope;
+    bool saved_unscoped = send_unscoped;
+    memset(send_scope.key, 0, sizeof(send_scope.key));
+    send_unscoped = false;
+    bool ok = sendGroupMessage(getRTCClock()->getCurrentTimeUnique(), ch.channel, _prefs.node_name, text, strlen(text));
+    send_scope = saved_scope;
+    send_unscoped = saved_unscoped;
+    return ok;
+  }
+  return false;
+}
+
+int MyMesh::botSendDirect(const uint8_t* pub_key, const char* text) {
+  if (!pub_key || !text) return 0;
+  ContactInfo* found = lookupContactByPubKey(pub_key, PUB_KEY_SIZE);
+  if (!found) return -1;   // removed (or overwritten) since the request arrived
+  const ContactInfo& to = *found;
+  TransportKey saved_scope = send_scope;
+  bool saved_unscoped = send_unscoped;
+  memset(send_scope.key, 0, sizeof(send_scope.key));
+  send_unscoped = false;
+  uint32_t expected_ack, est_timeout;
+  int rc = sendMessage(to, getRTCClock()->getCurrentTimeUnique(), 0, text, expected_ack, est_timeout);
+  send_scope = saved_scope;
+  send_unscoped = saved_unscoped;
+  return rc != MSG_SEND_FAILED ? 1 : 0;
+}
+
+bool MyMesh::botAdvert(bool flood) {
+  if (!flood) return advert();
+  mesh::Packet* pkt;
+  if (_prefs.advert_loc_policy == ADVERT_LOC_NONE) {
+    pkt = createSelfAdvert(_prefs.node_name);
+  } else {
+    pkt = createSelfAdvert(_prefs.node_name, sensors.node_lat, sensors.node_lon);
+  }
+  if (!pkt) return false;
+  TransportKey default_scope;
+  memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
+  sendFloodScoped(default_scope, pkt, 0);
+  return true;
+}
+
+bool MyMesh::botApplyNodeSettings(const char* name, const char* scope, double lat, double lon) {
+  if (name && name != _prefs.node_name && name[0] && AdvertDataParser::isValidName(name)) {
+    StrHelper::strncpy(_prefs.node_name, name, sizeof(_prefs.node_name));
+  }
+  if (!scope) scope = "";
+  StrHelper::strncpy(_prefs.default_scope_name, scope, sizeof(_prefs.default_scope_name));
+  if (_prefs.default_scope_name[0]) {
+    char scoped[sizeof(_prefs.default_scope_name) + 1];
+    snprintf(scoped, sizeof(scoped), "#%s", _prefs.default_scope_name);
+    TransportKeyStore temp;
+    TransportKey key;
+    temp.getAutoKeyFor(0, scoped, key);
+    memcpy(_prefs.default_scope_key, key.key, sizeof(key.key));
+  } else {
+    memset(_prefs.default_scope_key, 0, sizeof(_prefs.default_scope_key));   // null key = unscoped
+  }
+  sensors.node_lat = lat;
+  sensors.node_lon = lon;
+  // An unset (0,0) location is not advertised.
+  _prefs.advert_loc_policy = (lat == 0 && lon == 0) ? ADVERT_LOC_NONE : ADVERT_LOC_SHARE;
+  // As savePrefs(), but reporting whether the write worked.
+  _prefs.node_lat = sensors.node_lat;
+  _prefs.node_lon = sensors.node_lon;
+  bool ok = _store->savePrefs(_prefs);
+  if (ok) _prefs.clearDirty();   // after a failed write stay dirty, so a later save retries
+  return ok;
+}
+
+int MyMesh::botLastRssi() const {
+  return (int)radio_driver.getLastRSSI();
+}
+
+ContactInfo* MyMesh::botFindContactByName(const char* name, int* matches) {
+  int n = 0;
+  ContactInfo* first = nullptr;
+  if (name && name[0]) {
+    ContactInfo c;
+    for (int i = 0; i < getTotalContactSlots(); i++) {
+      if (!getContactByIdx(i, c) || c.type == ADV_TYPE_NONE || strcmp(c.name, name) != 0) continue;
+      if (n++ == 0) first = lookupContactByPubKey(c.id.pub_key, PUB_KEY_SIZE);
+    }
+  }
+  if (matches) *matches = n;
+  return first;
+}
+
+const char* MyMesh::botLookupPathName(const uint8_t* hash, uint8_t hash_size) {
+  if (!hash || hash_size == 0 || hash_size > PUB_KEY_SIZE) return nullptr;
+  int n = 0;
+  uint8_t key[PUB_KEY_SIZE];
+  ContactInfo c;
+  for (int i = 0; i < getTotalContactSlots(); i++) {
+    if (!getContactByIdx(i, c) || c.type == ADV_TYPE_NONE) continue;
+    if (memcmp(c.id.pub_key, hash, hash_size) != 0) continue;
+    if (++n > 1) return nullptr;
+    memcpy(key, c.id.pub_key, PUB_KEY_SIZE);
+  }
+  if (n != 1) return nullptr;
+  ContactInfo* p = lookupContactByPubKey(key, PUB_KEY_SIZE);
+  return (p && p->name[0]) ? p->name : nullptr;
+}
+
+bool MyMesh::botSaveWifi(const char* ssid, const char* pwd) {
+  if (!ssid || !ssid[0]) return false;
+  StrHelper::strncpy(_prefs.wifi_ssid, ssid, sizeof(_prefs.wifi_ssid));
+  if (pwd) StrHelper::strncpy(_prefs.wifi_pwd, pwd, sizeof(_prefs.wifi_pwd));   // null keeps the stored one
+  _prefs.wifi_enabled = 1;
+  // As savePrefs(), but reporting whether the write worked.
+  _prefs.node_lat = sensors.node_lat;
+  _prefs.node_lon = sensors.node_lon;
+  bool ok = _store->savePrefs(_prefs);
+  if (ok) _prefs.clearDirty();   // after a failed write stay dirty, so a later save retries
+  return ok;
+}
+
+bool MyMesh::botChannelName(int idx, char out[32]) {
+  if (idx < 0 || idx >= MAX_GROUP_CHANNELS || !out) return false;
+  ChannelDetails ch;
+  if (!getChannel(idx, ch) || ch.name[0] == 0) return false;
+  StrHelper::strncpy(out, ch.name, 32);
+  return true;
+}
+#endif
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {

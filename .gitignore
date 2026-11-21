@@ -36,3 +36,13 @@ scripts/__pycache__/*
 # Reduced-TLS mbedTLS archives, ~6 MB per arch, fetched by scripts/fetch_mbedtls_4k.sh.
 # Not committed because they must be rebuilt for every espressif32 platform bump.
 .mbedtls-4k/
+
+# Secrets and local overrides
+*-backup.txt
+*.key
+prv.key
+platformio_override.ini
+secrets.*
+
+# Local agent working notes
+.superpowers/

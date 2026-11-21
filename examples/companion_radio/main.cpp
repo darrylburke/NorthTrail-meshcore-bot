@@ -116,6 +116,18 @@ StdRNG fast_rng;
 SimpleMeshTables tables;
 MyMesh the_mesh(radio_driver, fast_rng, rtc_clock, tables, store);
 
+#ifdef WITH_BOT
+  #ifdef DISPLAY_CLASS
+    #error "WITH_BOT takes the mesh listener slot, which the display UI also needs"
+  #endif
+  #ifndef ESP32
+    #error "WITH_BOT needs the ESP32 SPIFFS file system"
+  #endif
+  #include "BotTask.h"
+  #include "BotWeb.h"
+  BotTask bot_task(the_mesh, rtc_clock, SPIFFS);
+#endif
+
 /* END GLOBAL OBJECTS */
 
 void halt() {
@@ -286,11 +298,21 @@ void setup() {
   the_mesh.setListener(&ui_task);
 #endif
 
+#ifdef WITH_BOT
+  bot_task.begin();
+  the_mesh.setListener(&bot_task);
+  bot_web.begin(bot_task, the_mesh);   // setup access point now, or the page once WiFi is up
+#endif
+
   board.onBootComplete();
 }
 
 void loop() {
   the_mesh.loop();
+#ifdef WITH_BOT
+  bot_task.loop();
+  bot_web.loop();
+#endif
   interface_manager.loop();
   sensors.loop();
 #ifdef DISPLAY_CLASS

@@ -124,6 +124,19 @@ public:
   bool advert();
   void enterCLIRescue();
 
+#ifdef WITH_BOT
+  // Chat bot hooks (loop task only). Sends always use the node's default scope.
+  bool botSendChannel(const char* channel_name, const char* text);   // false if the node has no such channel
+  int  botSendDirect(const uint8_t* pub_key, const char* text);      // fire-once, no ACK tracking; -1 no such contact, 0 failed, 1 sent
+  bool botAdvert(bool flood);
+  bool botApplyNodeSettings(const char* name, const char* scope, double lat, double lon);  // name may be null (kept); true when prefs saved
+  int  botLastRssi() const;
+  ContactInfo* botFindContactByName(const char* name, int* matches);  // exact, case-sensitive; *matches = how many matched
+  const char* botLookupPathName(const uint8_t* hash, uint8_t hash_size); // contact whose key starts with hash, nullptr if none or more than one
+  bool botSaveWifi(const char* ssid, const char* pwd);   // stores the credentials (pwd null: keep it) and enables WiFi; true when prefs saved
+  bool botChannelName(int idx, char out[32]);            // name of channel slot idx, false if empty or out of range
+#endif
+
   int  getRecentlyHeard(AdvertPath dest[], int max_num);
 
 protected:
@@ -255,6 +268,10 @@ private:
   bool _iter_started;
   bool _cli_rescue;
   bool send_unscoped;   // force un-scoped flood (instead of using send_scope)
+#ifdef WITH_BOT
+  bool _bot_cli_serial;    // true only while checkCLIRescueCmd runs a serial command
+  bool _bot_cli_discard;   // dropping the rest of an over-long "set bot.webpwd" line
+#endif
   char cli_command[80];
   char reply_buf[166];
   uint8_t app_target_ver;
