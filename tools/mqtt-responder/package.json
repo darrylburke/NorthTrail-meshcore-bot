@@ -1,0 +1,11 @@
+{
+  "name": "meshcore-bot-mqtt-responder",
+  "version": "0.2.0",
+  "description": "Command-line example responder and bot simulator for the MeshCore bot's MQTT requests",
+  "license": "MIT",
+  "private": true,
+  "bin": { "bot-responder": "./responder.js" },
+  "scripts": { "test": "node --test" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "mqtt": "^5.10.1" }
+}

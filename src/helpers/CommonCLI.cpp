@@ -1,0 +1,2134 @@
+#include <Arduino.h>
+#include "CommonCLI.h"
+#include "TxtDataHelpers.h"
+#include "AdvertDataHelpers.h"
+#include "AlertReporter.h"  // for alertReporterBannedChannelMatch()
+#include "MQTTPrefsAtomicStore.h"
+#include <RTClib.h>
+#include <Utils.h>
+#include <new>
+
+#ifndef BRIDGE_MAX_BAUD
+#define BRIDGE_MAX_BAUD 115200
+#endif
+#ifdef ESP_PLATFORM
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <esp_wifi.h>
+#include <esp_heap_caps.h>
+#else
+#include <malloc.h>  // mallinfo() for the `memory` command on nRF52/RP2040
+#endif
+#ifdef WITH_MQTT_BRIDGE
+#include "bridges/MQTTBridge.h"
+#include "MQTTDefaults.h"
+#include "MQTTPrefsCodec.h"
+#include "MQTTPrefsRecovery.h"
+#include "MQTTPrefsSerializer.h"
+#endif
+
+// Believe it or not, this std C function is busted on some platforms!
+static uint32_t _atoi(const char* sp) {
+  uint32_t n = 0;
+  while (*sp && *sp >= '0' && *sp <= '9') {
+    n *= 10;
+    n += (*sp++ - '0');
+  }
+  return n;
+}
+
+
+static bool isValidName(const char *n) {
+  while (*n) {
+    if (*n == '[' || *n == ']' || *n == '/' || *n == '\\' || *n == ':' || *n == ',' || *n == '?' || *n == '*') return false;
+    n++;
+  }
+  return true;
+}
+
+// Old fork firmware persisted the (since removed) NodePrefs MQTT fields to /com_prefs
+// as a zero-filled gap between owner_info (which ends at offset 290) and a trailing
+// observer block (rx_boosted_gain, flood_max_*, snmp/watchdog/alert settings).
+// The gap size depended on MAX_MQTT_SLOTS at the time: 306 bytes of non-slot fields
+// plus 186 bytes per slot (preset 24 + host 64 + port 2 + username 32 + password 64).
+// loadPrefsInt() uses the file size to tell the eras apart and recover the tail.
+static const size_t LEGACY_MQTT_GAP_6SLOT = 306 + 6 * 186;  // 1422
+static const size_t LEGACY_MQTT_GAP_3SLOT = 306 + 3 * 186;  // 864
+static const size_t LEGACY_OBS_TAIL_MAX = 124;  // rx_boosted(1) + flood(2) + snmp(25) + watchdog(1) + alert block(95)
+
+// Bytes the last binary layout wrote after owner_info (offsets 290-294):
+// rx_boosted_gain, flood_max_unscoped, flood_max_advert, radio_fem_rxgain,
+// cad_enabled. loadPrefsInt() treats any larger remainder as a legacy MQTT-gap
+// file. Prefs are now written as JSON, so this describes read-side history only.
+static const size_t COM_PREFS_TAIL_BYTES = 5;
+
+
+void CommonCLI::loadPrefs(FILESYSTEM* fs) {
+  bool is_fresh_install = false;
+  bool is_upgrade = false;
+  // Set when prefs came from one of the legacy binary files; they are republished
+  // as /prefs.json below. The legacy file is never removed, so it stays available
+  // as a fallback if the JSON save does not commit this boot.
+  bool loaded_from_legacy = false;
+
+  if (fs->exists("/prefs.json")) {
+#if defined(RP2040_PLATFORM)
+    File file = fs->open("/prefs.json", "r");
+#else
+    File file = fs->open("/prefs.json");
+#endif
+    if (file) {
+      _prefs->loadSerial(file);
+      file.close();
+    }
+  } else if (fs->exists("/com_prefs")) {
+    // Legacy binary layout. This is a file-format migration only: settings keep
+    // their stored values, so it must not trigger the bridge.source upgrade below.
+    loadPrefsInt(fs, "/com_prefs");
+    loaded_from_legacy = true;
+  } else if (fs->exists("/node_prefs")) {
+    loadPrefsInt(fs, "/node_prefs");
+    is_upgrade = true;  // pre-/com_prefs filename
+    loaded_from_legacy = true;
+  } else {
+    // File doesn't exist - set default bridge settings for fresh installs
+    is_fresh_install = true;
+    _prefs->bridge_pkt_src = 1;  // Default to RX (logRx) for new installs
+  }
+#ifdef WITH_MQTT_BRIDGE
+  // Load observer preferences (MQTT/WiFi/timezone/SNMP/alert) from /mqtt.json,
+  // migrating the old /mqtt_prefs binary when JSON does not exist yet.
+  // Readers (MQTTBridge, AlertReporter, observer CLI) use _mqtt_prefs directly —
+  // these fields no longer exist in NodePrefs, so there is nothing to sync.
+  MQTTPrefsAtomicStore::LegacyUpgradeGate legacy_upgrade(
+      _com_prefs_needs_upgrade || loaded_from_legacy);
+  loadMQTTPrefs(fs, &legacy_upgrade);
+  if (_mqtt_prefs_hold) legacy_upgrade.holdMqttSource();
+
+  // For MQTT bridge, migrate bridge.source to RX (logRx) only on fresh installs or upgrades
+  // so legacy "tx" is not the default. mqtt.rx / mqtt.tx are separate (fresh default: advert for TX)
+  if ((is_fresh_install || is_upgrade) && _prefs->bridge_pkt_src == 0) {
+    if (legacy_upgrade.blocksComPrefsRewrite()) {
+      MESH_DEBUG_PRINTLN("MQTT Bridge: deferring bridge.source migration until legacy prefs are preserved");
+    } else {
+      MESH_DEBUG_PRINTLN("MQTT Bridge: Migrating bridge.source from tx to rx (MQTT bridge default)");
+      _prefs->bridge_pkt_src = 1;  // Set to RX (logRx)
+      if (loaded_from_legacy) {
+        // The /prefs.json migration below persists this in-memory change.
+        MESH_DEBUG_PRINTLN("MQTT Bridge: bridge.source will be saved with the prefs migration");
+      } else {
+        savePrefs(fs);  // Save the updated preference
+      }
+    }
+  }
+  // mqtt_rx_enabled: new field appended to end of MQTTPrefs. On upgrade from older firmware,
+  // a shorter legacy /mqtt_prefs file won't contain it, so it keeps the default value (1 = on)
+  // set by setMQTTPrefsDefaults(). No explicit migration needed.
+#endif
+
+  // Republish legacy binary prefs as /prefs.json. Old-format files also carried a
+  // trailing observer block, which loadPrefsInt() recovered into _legacy_tail; wait
+  // for loadMQTTPrefs() to commit that to /mqtt.json first. The legacy file is left
+  // on flash either way, so a deferred or failed save just retries on the next boot.
+#ifdef WITH_MQTT_BRIDGE
+  if (loaded_from_legacy || _com_prefs_needs_upgrade) {
+    if (legacy_upgrade.mayRewriteComPrefs()) {
+      savePrefs(fs, false);   // loadMQTTPrefs already committed the MQTT payload
+      legacy_upgrade.recordComPrefsRewrite();
+      _com_prefs_needs_upgrade = false;
+    } else {
+      MESH_DEBUG_PRINTLN("Prefs: deferring /prefs.json migration until /mqtt.json commits");
+    }
+  }
+#else
+  if (loaded_from_legacy || _com_prefs_needs_upgrade) {
+    savePrefs(fs);
+    _com_prefs_needs_upgrade = false;
+  }
+#endif
+}
+
+void CommonCLI::loadPrefsInt(FILESYSTEM* fs, const char* filename) {  // Legacy prefs loader
+#if defined(RP2040_PLATFORM)
+  File file = fs->open(filename, "r");
+#else
+  File file = fs->open(filename);
+#endif
+  if (file) {
+    uint8_t pad[8];
+
+    file.read((uint8_t *)&_prefs->airtime_factor, sizeof(_prefs->airtime_factor));    // 0
+    file.read((uint8_t *)&_prefs->node_name, sizeof(_prefs->node_name));              // 4
+    file.read(pad, 4);                                                                // 36
+    file.read((uint8_t *)&_prefs->node_lat, sizeof(_prefs->node_lat));                // 40
+    file.read((uint8_t *)&_prefs->node_lon, sizeof(_prefs->node_lon));                // 48
+    file.read((uint8_t *)&_prefs->password[0], sizeof(_prefs->password));             // 56
+    file.read((uint8_t *)&_prefs->freq, sizeof(_prefs->freq));                        // 72
+    file.read((uint8_t *)&_prefs->tx_power_dbm, sizeof(_prefs->tx_power_dbm));        // 76
+    file.read((uint8_t *)&_prefs->disable_fwd, sizeof(_prefs->disable_fwd));          // 77
+    file.read((uint8_t *)&_prefs->advert_interval, sizeof(_prefs->advert_interval));  // 78
+    file.read(pad, 1);                                                                // 79 : 1 byte unused (was rx_boosted_gain in v1.14.1, moved to end for upgrade compat)
+    file.read((uint8_t *)&_prefs->rx_delay_base, sizeof(_prefs->rx_delay_base));      // 80
+    file.read((uint8_t *)&_prefs->tx_delay_factor, sizeof(_prefs->tx_delay_factor));  // 84
+    file.read((uint8_t *)&_prefs->guest_password[0], sizeof(_prefs->guest_password)); // 88
+    file.read((uint8_t *)&_prefs->direct_tx_delay_factor, sizeof(_prefs->direct_tx_delay_factor)); // 104
+    file.read(pad, 4);                                                                             // 108
+    file.read((uint8_t *)&_prefs->sf, sizeof(_prefs->sf));                                         // 112
+    file.read((uint8_t *)&_prefs->cr, sizeof(_prefs->cr));                                         // 113
+    file.read((uint8_t *)&_prefs->allow_read_only, sizeof(_prefs->allow_read_only));               // 114
+    file.read((uint8_t *)&_prefs->multi_acks, sizeof(_prefs->multi_acks));                         // 115
+    file.read((uint8_t *)&_prefs->bw, sizeof(_prefs->bw));                                         // 116
+    file.read((uint8_t *)&_prefs->agc_reset_interval, sizeof(_prefs->agc_reset_interval));         // 120
+    file.read((uint8_t *)&_prefs->path_hash_mode, sizeof(_prefs->path_hash_mode));                 // 121
+    file.read((uint8_t *)&_prefs->loop_detect, sizeof(_prefs->loop_detect));                       // 122
+    file.read(pad, 1);                                                                             // 123
+    file.read((uint8_t *)&_prefs->flood_max, sizeof(_prefs->flood_max));                           // 124
+    file.read((uint8_t *)&_prefs->flood_advert_interval, sizeof(_prefs->flood_advert_interval));   // 125
+    file.read((uint8_t *)&_prefs->interference_threshold, sizeof(_prefs->interference_threshold)); // 126
+    file.read((uint8_t *)&_prefs->bridge_enabled, sizeof(_prefs->bridge_enabled));                 // 127
+    file.read((uint8_t *)&_prefs->bridge_delay, sizeof(_prefs->bridge_delay));                     // 128
+    file.read((uint8_t *)&_prefs->bridge_pkt_src, sizeof(_prefs->bridge_pkt_src));                 // 130
+    file.read((uint8_t *)&_prefs->bridge_baud, sizeof(_prefs->bridge_baud));                       // 131
+    file.read((uint8_t *)&_prefs->bridge_channel, sizeof(_prefs->bridge_channel));                 // 135
+    file.read((uint8_t *)&_prefs->bridge_secret, sizeof(_prefs->bridge_secret));                   // 136
+    file.read((uint8_t *)&_prefs->powersaving_enabled, sizeof(_prefs->powersaving_enabled));       // 152
+    file.read(pad, 3);                                                                             // 153
+    file.read((uint8_t *)&_prefs->gps_enabled, sizeof(_prefs->gps_enabled));                       // 156
+    file.read((uint8_t *)&_prefs->gps_interval, sizeof(_prefs->gps_interval));                     // 157
+    file.read((uint8_t *)&_prefs->advert_loc_policy, sizeof (_prefs->advert_loc_policy));          // 161
+    file.read((uint8_t *)&_prefs->discovery_mod_timestamp, sizeof(_prefs->discovery_mod_timestamp)); // 162
+    file.read((uint8_t *)&_prefs->adc_multiplier, sizeof(_prefs->adc_multiplier));                 // 166
+    file.read((uint8_t *)_prefs->owner_info, sizeof(_prefs->owner_info));                          // 170
+    // MQTT/observer settings are no longer stored in /com_prefs — they live in
+    // /mqtt_prefs (loaded by loadMQTTPrefs). Old fork firmware wrote a zero-filled
+    // MQTT gap here followed by a trailing observer block; detect that layout by the
+    // extra length, skip the gap, and recover the tail so those settings survive
+    // the upgrade (the file is rewritten in the new layout by loadPrefs afterwards).
+    // Defaults for the trailing fields that older/shorter files may not contain.
+    // (upstream defaults: FEM RX gain on, CAD off) — overwritten below if present.
+    _prefs->radio_fem_rxgain = 1;
+    _prefs->cad_enabled = 0;
+    // A remainder larger than the new-format tail means an old fork file with the
+    // legacy MQTT gap; detect and recover it below.
+    size_t extra = file.available();
+    if (extra > COM_PREFS_TAIL_BYTES) {
+      _com_prefs_needs_upgrade = true;
+      size_t gap = 0;
+      if (extra > LEGACY_MQTT_GAP_6SLOT && extra <= LEGACY_MQTT_GAP_6SLOT + LEGACY_OBS_TAIL_MAX) {
+        gap = LEGACY_MQTT_GAP_6SLOT;
+      } else if (extra > LEGACY_MQTT_GAP_3SLOT && extra <= LEGACY_MQTT_GAP_3SLOT + LEGACY_OBS_TAIL_MAX) {
+        gap = LEGACY_MQTT_GAP_3SLOT;
+      }
+      // Unrecognized legacy sizes (e.g. pre-slot-era files) leave gap == 0: the tail
+      // is not read and everything past owner_info degrades to defaults.
+      if (gap > 0) {
+        uint8_t skip_buf[64];
+        size_t remaining = gap;
+        while (remaining > 0) {
+          size_t n = remaining > sizeof(skip_buf) ? sizeof(skip_buf) : remaining;
+          file.read(skip_buf, n);
+          remaining -= n;
+        }
+        file.read((uint8_t *)&_prefs->rx_boosted_gain, sizeof(_prefs->rx_boosted_gain));
+        // Tail layout: flood_max_unscoped, flood_max_advert, then the snmp fields —
+        // except legacy flex-branch files where snmp starts right after
+        // rx_boosted_gain (no flood_max_*). Same heuristic the old firmware used:
+        // snmp_enabled is 0/1 and the first community char is printable (> 64).
+        uint8_t b1 = 0, b2 = 0;
+        bool have_flood_bytes = file.available() >= 2;
+        if (have_flood_bytes) {
+          file.read(&b1, 1);
+          file.read(&b2, 1);
+        }
+#ifdef WITH_MQTT_BRIDGE
+        // Pre-fill with the same defaults applyMQTTDefaults() uses, so fields a
+        // shorter (older) tail doesn't contain degrade to defaults when applied.
+        memset(&_legacy_tail, 0, sizeof(_legacy_tail));
+        strncpy(_legacy_tail.snmp_community, "public", sizeof(_legacy_tail.snmp_community) - 1);
+        _legacy_tail.radio_watchdog_minutes = 5;
+        _legacy_tail.alert_wifi_minutes = 30;
+        _legacy_tail.alert_mqtt_minutes = 240;
+        _legacy_tail.alert_min_interval_min = 60;
+#endif
+        if (have_flood_bytes && b1 <= 1 && b2 > 64) {
+          // Legacy variant: no flood_max_* — b1/b2 are snmp_enabled + community[0]
+#ifdef WITH_MQTT_BRIDGE
+          _legacy_tail.snmp_enabled = b1;
+          _legacy_tail.snmp_community[0] = (char) b2;
+          if (file.available() >= (int)(sizeof(_legacy_tail.snmp_community) - 1)) {
+            file.read((uint8_t *)&_legacy_tail.snmp_community[1], sizeof(_legacy_tail.snmp_community) - 1);
+          }
+#endif
+        } else if (have_flood_bytes) {
+          _prefs->flood_max_unscoped = b1;
+          _prefs->flood_max_advert = b2;
+#ifdef WITH_MQTT_BRIDGE
+          if (file.available() >= (int)sizeof(_legacy_tail.snmp_enabled)) {
+            file.read((uint8_t *)&_legacy_tail.snmp_enabled, sizeof(_legacy_tail.snmp_enabled));
+          }
+          if (file.available() >= (int)sizeof(_legacy_tail.snmp_community)) {
+            file.read((uint8_t *)&_legacy_tail.snmp_community, sizeof(_legacy_tail.snmp_community));
+          }
+#endif
+        }
+#ifdef WITH_MQTT_BRIDGE
+        if (file.available() >= (int)sizeof(_legacy_tail.radio_watchdog_minutes)) {
+          file.read((uint8_t *)&_legacy_tail.radio_watchdog_minutes, sizeof(_legacy_tail.radio_watchdog_minutes));
+        }
+        if (file.available() >= (int)sizeof(_legacy_tail.alert_enabled)) {
+          file.read((uint8_t *)&_legacy_tail.alert_enabled, sizeof(_legacy_tail.alert_enabled));
+        }
+        if (file.available() >= (int)sizeof(_legacy_tail.alert_psk_hex)) {
+          file.read((uint8_t *)&_legacy_tail.alert_psk_hex, sizeof(_legacy_tail.alert_psk_hex));
+        }
+        if (file.available() >= (int)sizeof(_legacy_tail.alert_wifi_minutes)) {
+          file.read((uint8_t *)&_legacy_tail.alert_wifi_minutes, sizeof(_legacy_tail.alert_wifi_minutes));
+        }
+        if (file.available() >= (int)sizeof(_legacy_tail.alert_mqtt_minutes)) {
+          file.read((uint8_t *)&_legacy_tail.alert_mqtt_minutes, sizeof(_legacy_tail.alert_mqtt_minutes));
+        }
+        if (file.available() >= (int)sizeof(_legacy_tail.alert_min_interval_min)) {
+          file.read((uint8_t *)&_legacy_tail.alert_min_interval_min, sizeof(_legacy_tail.alert_min_interval_min));
+        }
+        if (file.available() >= (int)sizeof(_legacy_tail.alert_hashtag)) {
+          file.read((uint8_t *)&_legacy_tail.alert_hashtag, sizeof(_legacy_tail.alert_hashtag));
+        }
+        if (file.available() >= (int)sizeof(_legacy_tail.alert_region)) {
+          file.read((uint8_t *)&_legacy_tail.alert_region, sizeof(_legacy_tail.alert_region));
+        }
+        _legacy_tail.snmp_enabled = constrain(_legacy_tail.snmp_enabled, 0, 1);
+        _legacy_tail.radio_watchdog_minutes = constrain(_legacy_tail.radio_watchdog_minutes, 0, 120);
+        _legacy_tail.alert_enabled = constrain(_legacy_tail.alert_enabled, 0, 1);
+        _legacy_tail.snmp_community[sizeof(_legacy_tail.snmp_community) - 1] = '\0';
+        _legacy_tail.alert_psk_hex[sizeof(_legacy_tail.alert_psk_hex) - 1] = '\0';
+        _legacy_tail.alert_hashtag[sizeof(_legacy_tail.alert_hashtag) - 1] = '\0';
+        _legacy_tail.alert_region[sizeof(_legacy_tail.alert_region) - 1] = '\0';
+        _legacy_tail.valid = true;
+#endif
+      }
+    } else {
+      if (file.available() >= (int)sizeof(_prefs->rx_boosted_gain)) {
+        file.read((uint8_t *)&_prefs->rx_boosted_gain, sizeof(_prefs->rx_boosted_gain));
+      }
+      if (file.available() >= (int)sizeof(_prefs->flood_max_unscoped)) {
+        file.read((uint8_t *)&_prefs->flood_max_unscoped, sizeof(_prefs->flood_max_unscoped));
+      }
+      if (file.available() >= (int)sizeof(_prefs->flood_max_advert)) {
+        file.read((uint8_t *)&_prefs->flood_max_advert, sizeof(_prefs->flood_max_advert));
+      }
+      if (file.available() >= (int)sizeof(_prefs->radio_fem_rxgain)) {   // 293
+        file.read((uint8_t *)&_prefs->radio_fem_rxgain, sizeof(_prefs->radio_fem_rxgain));
+      }
+      if (file.available() >= (int)sizeof(_prefs->cad_enabled)) {        // 294
+        file.read((uint8_t *)&_prefs->cad_enabled, sizeof(_prefs->cad_enabled));
+      }
+    }
+
+    // sanitise bad pref values
+    _prefs->rx_delay_base = constrain(_prefs->rx_delay_base, 0, 20.0f);
+    _prefs->tx_delay_factor = constrain(_prefs->tx_delay_factor, 0, 2.0f);
+    _prefs->direct_tx_delay_factor = constrain(_prefs->direct_tx_delay_factor, 0, 2.0f);
+    _prefs->airtime_factor = constrain(_prefs->airtime_factor, 0, 9.0f);
+    _prefs->freq = constrain(_prefs->freq, 150.0f, 2500.0f);
+    _prefs->bw = constrain(_prefs->bw, 7.8f, 500.0f);
+    _prefs->sf = constrain(_prefs->sf, 5, 12);
+    _prefs->cr = constrain(_prefs->cr, 5, 8);
+    _prefs->tx_power_dbm = constrain(_prefs->tx_power_dbm, -9, 30);
+    _prefs->multi_acks = constrain(_prefs->multi_acks, 0, 1);
+    _prefs->adc_multiplier = constrain(_prefs->adc_multiplier, 0.0f, 10.0f);
+    _prefs->path_hash_mode = constrain(_prefs->path_hash_mode, 0, 2);   // NOTE: mode 3 reserved for future
+    _prefs->loop_detect = constrain(_prefs->loop_detect, 0, 3);          // LOOP_DETECT_OFF..LOOP_DETECT_STRICT
+    _prefs->radio_fem_rxgain = constrain(_prefs->radio_fem_rxgain, 0, 1); // boolean
+    _prefs->cad_enabled = constrain(_prefs->cad_enabled, 0, 1);          // boolean
+
+    // sanitise bad bridge pref values
+    _prefs->bridge_enabled = constrain(_prefs->bridge_enabled, 0, 1);
+    _prefs->bridge_delay = constrain(_prefs->bridge_delay, 0, 10000);
+    _prefs->bridge_pkt_src = constrain(_prefs->bridge_pkt_src, 0, 1);
+    _prefs->bridge_baud = constrain(_prefs->bridge_baud, 9600, BRIDGE_MAX_BAUD);
+    _prefs->bridge_channel = constrain(_prefs->bridge_channel, 0, 14);
+
+    _prefs->powersaving_enabled = constrain(_prefs->powersaving_enabled, 0, 1);
+
+    _prefs->gps_enabled = constrain(_prefs->gps_enabled, 0, 1);
+    _prefs->advert_loc_policy = constrain(_prefs->advert_loc_policy, 0, 2);
+
+    _prefs->rx_boosted_gain = constrain(_prefs->rx_boosted_gain, 0, 1); // boolean
+    _prefs->radio_fem_rxgain = constrain(_prefs->radio_fem_rxgain, 0, 1); // boolean
+    _prefs->radio_fem_txgain = constrain(_prefs->radio_fem_txgain, 0, 1); // boolean
+    _prefs->cad_enabled = constrain(_prefs->cad_enabled, 0, 1); // boolean
+
+    file.close();
+  }
+}
+
+bool CommonCLI::savePrefs(FILESYSTEM* fs, bool save_mqtt) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  fs->remove("/prefs.json");
+  File file = fs->open("/prefs.json", FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  File file = fs->open("/prefs.json", "w");
+#else
+  File file = fs->open("/prefs.json", "w", true);
+#endif
+  bool success = false;
+  if (file) {
+    success = _prefs->saveSerial(file);
+    file.close();
+  }
+#ifdef WITH_MQTT_BRIDGE
+  // Observer config (MQTT/WiFi/timezone/SNMP/alert) is persisted separately. The
+  // observer CLI writes _mqtt_prefs directly, so no NodePrefs->MQTTPrefs sync runs.
+  // Ordinary NodePrefs callers leave save_mqtt false; migration is the only
+  // workflow that may explicitly combine these independent transactions.
+  if (save_mqtt) saveMQTTPrefs(fs);
+#endif
+  return success;
+}
+
+#ifdef WITH_MQTT_BRIDGE
+static const uint32_t MQTT_JSON_FNV1A_OFFSET_BASIS = 2166136261u;
+static const uint32_t MQTT_JSON_FNV1A_PRIME = 16777619u;
+
+// Set default values for MQTT preferences (used when file doesn't exist or is corrupted)
+static void setMQTTPrefsDefaults(MQTTPrefs* prefs) {
+  applyMQTTDefaults(prefs);
+}
+
+static File openMqttPrefsRead(FILESYSTEM* fs, const char* path = "/mqtt_prefs") {
+#if defined(RP2040_PLATFORM)
+  return fs->open(path, "r");
+#else
+  return fs->open(path);
+#endif
+}
+
+enum class JsonPrefsLoadResult : uint8_t {
+  Loaded,
+  LoadedWithRepairs,
+  UnsupportedVersion,
+  FutureClaimed,
+  Invalid,
+  NoMemory,
+};
+
+static bool jsonPrefsLoaded(JsonPrefsLoadResult result) {
+  return result == JsonPrefsLoadResult::Loaded ||
+         result == JsonPrefsLoadResult::LoadedWithRepairs;
+}
+
+static JsonPrefsLoadResult loadMqttJsonFile(FILESYSTEM* fs, const char* path,
+                                             MQTTPrefs* output) {
+  if (output == nullptr) return JsonPrefsLoadResult::Invalid;
+  applyMQTTDefaults(output);
+
+  // Probe the root version without applying the v1 schema. A future version
+  // may legitimately change an existing field's type, and must still be held
+  // opaquely rather than misclassified as corrupt and rolled back.
+  File version_file = openMqttPrefsRead(fs, path);
+  if (!version_file) return JsonPrefsLoadResult::Invalid;
+  MQTTPrefsVersionProbe version_probe;
+  const bool version_parsed = version_probe.loadSerial(version_file);
+  version_file.close();
+  if (version_probe.hasFutureVersion()) {
+    return version_parsed ? JsonPrefsLoadResult::UnsupportedVersion
+                          : JsonPrefsLoadResult::FutureClaimed;
+  }
+
+  File file = openMqttPrefsRead(fs, path);
+  if (!file) return JsonPrefsLoadResult::Invalid;
+  MQTTPrefsSerializer serializer(output);
+  const bool parsed = serializer.loadSerial(file);
+  file.close();
+  if (!parsed) return JsonPrefsLoadResult::Invalid;
+  if (serializer.hasFutureVersion()) return JsonPrefsLoadResult::UnsupportedVersion;
+  bool repaired = false;
+  if (!serializer.apply(&repaired)) return JsonPrefsLoadResult::Invalid;
+  return repaired ? JsonPrefsLoadResult::LoadedWithRepairs : JsonPrefsLoadResult::Loaded;
+}
+
+// Parse `path` through a heap scratch object and publish it over `dest` only
+// once the whole file is known good, so a late failure cannot leave the live
+// preferences half-loaded.
+static JsonPrefsLoadResult adoptMqttJsonFile(FILESYSTEM* fs, const char* path,
+                                              MQTTPrefs* dest) {
+  MQTTPrefs* scratch = new (std::nothrow) MQTTPrefs;
+  if (scratch == nullptr) return JsonPrefsLoadResult::NoMemory;
+  const JsonPrefsLoadResult result = loadMqttJsonFile(fs, path, scratch);
+  if (jsonPrefsLoaded(result)) memcpy(dest, scratch, sizeof(*dest));
+  delete scratch;
+  return result;
+}
+
+static MQTTPrefsRecovery::FileState mqttJsonFileState(FILESYSTEM* fs, const char* path) {
+  if (!fs->exists(path)) return MQTTPrefsRecovery::FileState::Missing;
+  MQTTPrefs* scratch = new (std::nothrow) MQTTPrefs;
+  if (scratch == nullptr) return MQTTPrefsRecovery::FileState::Indeterminate;
+  const JsonPrefsLoadResult result = loadMqttJsonFile(fs, path, scratch);
+  delete scratch;
+  if (result == JsonPrefsLoadResult::UnsupportedVersion) {
+    // Syntax and the mandatory version field were valid, so this can be a
+    // fully verified transaction written by newer firmware. Keep it distinct
+    // from a torn/corrupt temp during recovery.
+    return MQTTPrefsRecovery::FileState::FutureUsable;
+  }
+  if (result == JsonPrefsLoadResult::FutureClaimed) {
+    return MQTTPrefsRecovery::FileState::FutureClaimed;
+  }
+  return result == JsonPrefsLoadResult::Loaded ||
+         result == JsonPrefsLoadResult::LoadedWithRepairs
+      ? MQTTPrefsRecovery::FileState::Usable
+      : MQTTPrefsRecovery::FileState::Preserve;
+}
+
+// hold: observer writes must not replace whatever was left on disk.
+// run_from_backup: nothing was renamed and /mqtt.json does not exist; this boot
+// reads the last committed image straight out of /mqtt.json.bak.
+struct MqttJsonRecovery {
+  bool hold;
+  bool run_from_backup;
+};
+
+static MqttJsonRecovery recoverMqttJsonFiles(FILESYSTEM* fs) {
+  const MQTTPrefsRecovery::FileState primary = mqttJsonFileState(fs, "/mqtt.json");
+  const MQTTPrefsRecovery::FileState temp = mqttJsonFileState(fs, "/mqtt.json.tmp");
+  const MQTTPrefsRecovery::FileState backup = mqttJsonFileState(fs, "/mqtt.json.bak");
+  const MQTTPrefsRecovery::Action action = MQTTPrefsRecovery::select(primary, temp, backup);
+
+  if (action == MQTTPrefsRecovery::Action::KeepPrimary) {
+    if (primary == MQTTPrefsRecovery::FileState::Usable) {
+      if (!MQTTPrefsRecovery::uncertain(temp) &&
+          temp != MQTTPrefsRecovery::FileState::Missing) {
+        fs->remove("/mqtt.json.tmp");
+      }
+      if (!MQTTPrefsRecovery::uncertain(backup) &&
+          backup != MQTTPrefsRecovery::FileState::Missing) {
+        fs->remove("/mqtt.json.bak");
+      }
+    }
+    return {MQTTPrefsRecovery::uncertain(primary) ||
+                MQTTPrefsRecovery::uncertain(temp) ||
+                MQTTPrefsRecovery::uncertain(backup),
+            false};
+  }
+  if (action == MQTTPrefsRecovery::Action::DiscardTemp) {
+    if (fs->remove("/mqtt.json.tmp")) {
+      MESH_DEBUG_PRINTLN("MQTT: discarded incomplete first-migration JSON temp");
+      return {false, false};
+    }
+    MESH_DEBUG_PRINTLN("MQTT: could not discard incomplete /mqtt.json temp; source held");
+    return {true, false};
+  }
+  if (action == MQTTPrefsRecovery::Action::PromoteTemp) {
+    if (fs->rename("/mqtt.json.tmp", "/mqtt.json")) {
+      if (temp == MQTTPrefsRecovery::FileState::Usable &&
+          backup != MQTTPrefsRecovery::FileState::Missing) {
+        fs->remove("/mqtt.json.bak");
+      }
+      MESH_DEBUG_PRINTLN("MQTT: recovered /mqtt.json from transaction temp");
+      return {MQTTPrefsRecovery::uncertain(temp) ||
+                  MQTTPrefsRecovery::uncertain(backup),
+              false};
+    }
+    MESH_DEBUG_PRINTLN("MQTT: could not recover /mqtt.json temp; files preserved");
+    return {true, false};
+  }
+  if (action == MQTTPrefsRecovery::Action::UseBackupHeld) {
+    // Deliberately rename nothing. The empty primary name is what records that
+    // the interrupted commit had already moved the old image aside, and a boot
+    // that cannot classify the candidate must not spend that record: a later
+    // boot with more heap, or firmware that understands the candidate, promotes
+    // it through the ordinary rule instead of deleting it as a stale artifact.
+    MESH_DEBUG_PRINTLN("MQTT: unresolved /mqtt.json candidate; running the backup in place and holding writes");
+    return {true, true};
+  }
+  if (action == MQTTPrefsRecovery::Action::RunDefaultsHeld) {
+    // Same reasoning, with no image this firmware can run: renaming either file
+    // would spend transaction state that a later boot still needs.
+    MESH_DEBUG_PRINTLN("MQTT: unresolved /mqtt.json candidate and no runnable backup; "
+                       "using defaults (files preserved)");
+    return {true, false};
+  }
+  if (action == MQTTPrefsRecovery::Action::PromoteBackup) {
+    if (fs->rename("/mqtt.json.bak", "/mqtt.json")) {
+      if (backup == MQTTPrefsRecovery::FileState::Usable &&
+          !MQTTPrefsRecovery::uncertain(temp) &&
+          temp != MQTTPrefsRecovery::FileState::Missing) {
+        fs->remove("/mqtt.json.tmp");
+      }
+      MESH_DEBUG_PRINTLN("MQTT: recovered /mqtt.json from transaction backup");
+      return {MQTTPrefsRecovery::uncertain(temp) ||
+                  MQTTPrefsRecovery::uncertain(backup),
+              false};
+    }
+    MESH_DEBUG_PRINTLN("MQTT: could not recover /mqtt.json backup; files preserved");
+    return {true, false};
+  }
+  return {false, false};
+}
+
+static MQTTPrefsRecovery::FileState mqttPrefsFileState(FILESYSTEM* fs, const char* path) {
+  if (!fs->exists(path)) return MQTTPrefsRecovery::FileState::Missing;
+  File file = openMqttPrefsRead(fs, path);
+  if (!file) return MQTTPrefsRecovery::FileState::Preserve;
+  const size_t file_size = file.size();
+  uint8_t prefix[sizeof(MQTTPrefsHeader)] = {};
+  const size_t prefix_size = file_size < sizeof(prefix) ? file_size : sizeof(prefix);
+  const size_t prefix_read = file.read(prefix, prefix_size);
+  file.close();
+  return MQTTPrefsCodec::classify(prefix, prefix_read, file_size).preserve_file
+      ? MQTTPrefsRecovery::FileState::Preserve
+      : MQTTPrefsRecovery::FileState::Usable;
+}
+
+// Restore the only usable image before the normal loader inspects /mqtt_prefs.
+// SPIFFS cannot rename over an existing destination, so publishing moves the
+// old primary to .bak before moving the verified temp into the empty name.
+// The decision helper deliberately treats unsupported/corrupt files as opaque:
+// no recovery path overwrites one with an older layout.
+static bool recoverMqttPrefsFiles(FILESYSTEM* fs) {
+  const MQTTPrefsRecovery::FileState primary = mqttPrefsFileState(fs, "/mqtt_prefs");
+  const MQTTPrefsRecovery::FileState temp = mqttPrefsFileState(fs, "/mqtt_prefs.tmp");
+  const MQTTPrefsRecovery::FileState backup = mqttPrefsFileState(fs, "/mqtt_prefs.bak");
+  const MQTTPrefsRecovery::Action action = MQTTPrefsRecovery::select(primary, temp, backup);
+
+  if (action == MQTTPrefsRecovery::Action::KeepPrimary) {
+    // A current/known legacy primary has already published. Every transaction
+    // artifact is therefore unpublished or stale, including a partial temp
+    // left by a reset during write(), and can be discarded. Preserve artifacts
+    // only when the primary itself is opaque (the branch above still keeps it).
+    if (primary == MQTTPrefsRecovery::FileState::Usable) {
+      if (temp != MQTTPrefsRecovery::FileState::Missing) fs->remove("/mqtt_prefs.tmp");
+      if (backup != MQTTPrefsRecovery::FileState::Missing) fs->remove("/mqtt_prefs.bak");
+    }
+    return false;
+  }
+  if (action == MQTTPrefsRecovery::Action::DiscardTemp) {
+    if (fs->remove("/mqtt_prefs.tmp")) {
+      MESH_DEBUG_PRINTLN("MQTT: discarded incomplete legacy transaction temp");
+      return false;
+    }
+    MESH_DEBUG_PRINTLN("MQTT: could not discard incomplete /mqtt_prefs temp; source held");
+    return true;
+  }
+  if (action == MQTTPrefsRecovery::Action::PromoteTemp) {
+    if (fs->rename("/mqtt_prefs.tmp", "/mqtt_prefs")) {
+      // A usable temp is now the committed primary. Its backup is necessarily
+      // a stale transaction artifact, even if this firmware cannot decode it.
+      if (temp == MQTTPrefsRecovery::FileState::Usable &&
+          backup != MQTTPrefsRecovery::FileState::Missing) {
+        fs->remove("/mqtt_prefs.bak");
+      }
+      MESH_DEBUG_PRINTLN("MQTT: recovered /mqtt_prefs from transaction temp");
+      return false;
+    }
+    MESH_DEBUG_PRINTLN("MQTT: could not recover /mqtt_prefs temp; files preserved");
+    return true;
+  }
+  if (action == MQTTPrefsRecovery::Action::UseBackupHeld ||
+      action == MQTTPrefsRecovery::Action::RunDefaultsHeld) {
+    // Unreachable for the binary format, whose classifier never reports an
+    // uncertain state. Hold rather than fall through to "nothing to do" if a
+    // later classifier change makes it reachable.
+    return true;
+  }
+  if (action == MQTTPrefsRecovery::Action::PromoteBackup) {
+    if (fs->rename("/mqtt_prefs.bak", "/mqtt_prefs")) {
+      // Symmetric case: a usable backup is now primary, so any interrupted
+      // temp is no longer authoritative and must not block a later save.
+      if (backup == MQTTPrefsRecovery::FileState::Usable &&
+          temp != MQTTPrefsRecovery::FileState::Missing) {
+        fs->remove("/mqtt_prefs.tmp");
+      }
+      MESH_DEBUG_PRINTLN("MQTT: recovered /mqtt_prefs from transaction backup");
+      return false;
+    }
+    MESH_DEBUG_PRINTLN("MQTT: could not recover /mqtt_prefs backup; files preserved");
+    return true;
+  }
+  return false;
+}
+
+// Filesystem adapter for the ConfigSerializer image. It writes to
+// /mqtt.json.tmp and verifies its size and checksum. Publishing is a recoverable SPIFFS
+// transaction: primary -> .bak, then tmp -> primary, then best-effort backup
+// cleanup. A power loss at every boundary leaves at least one recoverable file.
+class MQTTPrefsJsonFileStore {
+public:
+  explicit MQTTPrefsJsonFileStore(FILESYSTEM* fs) : _fs(fs) {}
+
+  bool begin() {
+    _finished = false;
+    _open = false;
+    _owns_temp = false;
+    _owns_backup = false;
+    _bytes_written = 0;
+    _expected_crc = MQTT_JSON_FNV1A_OFFSET_BASIS;
+    // Recovery owns stale artifacts. Do not delete them here: a power cut, or a
+    // failed commit that could not be rolled back, may have moved the old
+    // primary to .bak and left a verified temp that the next boot must choose
+    // between. Refusing the save is safer than erasing an image this firmware
+    // cannot decode.
+    if (_fs->exists("/mqtt.json.tmp") || _fs->exists("/mqtt.json.bak")) return false;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+    _file = _fs->open("/mqtt.json.tmp", FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+    _file = _fs->open("/mqtt.json.tmp", "w");
+#else
+    _file = _fs->open("/mqtt.json.tmp", "w", true);
+#endif
+    _open = _file;
+    _owns_temp = _open;
+    return _open;
+  }
+
+  size_t write(const uint8_t* bytes, size_t size) {
+    if (!_open) return 0;
+    const size_t written = _file.write(bytes, size);
+    for (size_t i = 0; i < written; ++i) {
+      _expected_crc = (_expected_crc ^ bytes[i]) * MQTT_JSON_FNV1A_PRIME;
+    }
+    _bytes_written += written;
+    return written;
+  }
+
+  bool finish() {
+    if (!_open) return false;
+    _file.close();
+    _open = false;
+#if defined(RP2040_PLATFORM)
+    File verify = _fs->open("/mqtt.json.tmp", "r");
+#else
+    File verify = _fs->open("/mqtt.json.tmp");
+#endif
+    if (!verify) return false;
+    uint32_t actual_crc = MQTT_JSON_FNV1A_OFFSET_BASIS;
+    size_t actual_size = 0;
+    bool read_failed = false;
+    uint8_t buf[64];
+    while (verify.available() > 0) {
+      // Arduino File implementations normally return a byte count, but some
+      // Stream implementations use -1 for a read error. Keep that sentinel
+      // signed so it cannot become a huge size_t and overrun this buffer.
+      const int count = static_cast<int>(verify.read(buf, sizeof(buf)));
+      if (count <= 0) {
+        read_failed = count < 0;
+        break;
+      }
+      actual_size += static_cast<size_t>(count);
+      for (int i = 0; i < count; ++i) {
+        actual_crc = (actual_crc ^ buf[i]) * MQTT_JSON_FNV1A_PRIME;
+      }
+    }
+    const bool complete = !read_failed &&
+                          verify.size() == _bytes_written &&
+                          actual_size == _bytes_written &&
+                          actual_crc == _expected_crc;
+    verify.close();
+    if (!complete) return false;
+    _finished = true;
+    return true;
+  }
+
+  bool commit() {
+    if (!_finished) return false;
+    // SPIFFS refuses rename(tmp, existing_dest). Move the existing image to a
+    // recoverable backup first, then publish temp into the now-empty primary.
+    // A power cut at either boundary is resolved by boot recovery; a failure
+    // that returns here is undone by rollbackFailedCommit().
+    if (_fs->exists("/mqtt.json.bak")) return false;
+    if (_fs->exists("/mqtt.json")) {
+      if (!_fs->rename("/mqtt.json", "/mqtt.json.bak")) return false;
+      _owns_backup = true;
+    }
+    if (!_fs->rename("/mqtt.json.tmp", "/mqtt.json")) return false;
+    // Cleanup failure is non-fatal: the new primary is published and recovery
+    // will remove a known-good stale backup on a later boot.
+    if (_fs->exists("/mqtt.json.bak")) _fs->remove("/mqtt.json.bak");
+    return true;
+  }
+
+  // Undo a commit that failed midway. Without this, a failed publish can leave
+  // the old primary parked in .bak and the verified temp still holding the new
+  // image, which boot recovery then promotes — so a setter that told the
+  // operator the change was rolled back would be wrong after the next reset.
+  //
+  // Republishing the backup is the operation that matters: once the primary
+  // name is occupied, recovery keeps it and treats the temp as stale, so the
+  // temp removal below is only housekeeping. Returns false when the
+  // pre-transaction state could not be restored and the outcome of the next
+  // boot is therefore uncertain.
+  bool rollbackFailedCommit() {
+    // Only ever restore the backup this transaction made. Anything else under
+    // that name predates the transaction and is recovery's to resolve.
+    if (_owns_backup && !_fs->exists("/mqtt.json") &&
+        !_fs->rename("/mqtt.json.bak", "/mqtt.json")) {
+      return false;
+    }
+    _owns_backup = false;
+    if (_owns_temp && _fs->exists("/mqtt.json.tmp") && !_fs->remove("/mqtt.json.tmp")) {
+      // A verified temp still outranks a missing primary during recovery, so
+      // this is only harmless if the primary name is occupied again.
+      return _fs->exists("/mqtt.json");
+    }
+    return true;
+  }
+
+  // Drop a temp that was written and byte-verified but then rejected. Returns
+  // false when it is still on flash and no primary outranks it: recovery
+  // promotes a lone temp, so the caller cannot claim the change was undone.
+  bool discardFinishedTemp() {
+    if (_open) _file.close();
+    _open = false;
+    bool removed = true;
+    if (_owns_temp && _fs->exists("/mqtt.json.tmp")) {
+      removed = _fs->remove("/mqtt.json.tmp");
+    }
+    _finished = false;
+    _owns_temp = false;
+    return removed || _fs->exists("/mqtt.json");
+  }
+
+  // Same disposition contract as discardFinishedTemp(). Only unfinished staging
+  // is disposable here: once finish() has verified the temp,
+  // rollbackFailedCommit() has already decided its fate, and a temp that
+  // survived that is one recovery must resolve after reset.
+  bool abort() {
+    if (_open) _file.close();
+    _open = false;
+    bool removed = true;
+    if (_owns_temp && !_finished && _fs->exists("/mqtt.json.tmp")) {
+      removed = _fs->remove("/mqtt.json.tmp");
+    }
+    _finished = false;
+    _owns_temp = false;
+    _owns_backup = false;
+    return removed || _fs->exists("/mqtt.json");
+  }
+
+private:
+  FILESYSTEM* _fs;
+  File _file;
+  bool _open = false;
+  bool _finished = false;
+  bool _owns_temp = false;
+  // This transaction moved the old primary to /mqtt.json.bak, so a failed
+  // publish may put it back. Never true for a backup it did not create.
+  bool _owns_backup = false;
+  size_t _bytes_written = 0;
+  uint32_t _expected_crc = MQTT_JSON_FNV1A_OFFSET_BASIS;
+};
+
+class MQTTPrefsStoreStream : public Stream {
+public:
+  explicit MQTTPrefsStoreStream(MQTTPrefsJsonFileStore* store) : _store(store) {}
+
+  size_t write(uint8_t byte) override { return write(&byte, 1); }
+  size_t write(const uint8_t* buffer, size_t size) override {
+    if (!_ok || _store == nullptr) return 0;
+    const size_t written = _store->write(buffer, size);
+    if (written != size) _ok = false;
+    return written;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  bool ok() const { return _ok; }
+
+private:
+  MQTTPrefsJsonFileStore* _store;
+  bool _ok = true;
+};
+
+#endif  // WITH_MQTT_BRIDGE
+
+#ifdef WITH_MQTT_BRIDGE
+
+void CommonCLI::loadMQTTPrefs(
+    FILESYSTEM* fs, MQTTPrefsAtomicStore::LegacyUpgradeGate* legacy_upgrade) {
+  setMQTTPrefsDefaults(&_mqtt_prefs);
+  const MqttJsonRecovery recovery = recoverMqttJsonFiles(fs);
+  _mqtt_prefs_hold = recovery.hold;
+
+  // An interrupted commit left a candidate this boot cannot classify, so
+  // recovery renamed nothing. Read the last committed image out of the backup
+  // rather than publishing it: the transaction filenames must survive this boot
+  // intact for a later one to promote the candidate.
+  if (recovery.run_from_backup) {
+    _legacy_tail.valid = false;
+    const JsonPrefsLoadResult backup_result =
+        adoptMqttJsonFile(fs, "/mqtt.json.bak", &_mqtt_prefs);
+    if (jsonPrefsLoaded(backup_result)) {
+      MESH_DEBUG_PRINTLN("MQTT: running the /mqtt.json backup; candidate preserved and writes held");
+    } else {
+      setMQTTPrefsDefaults(&_mqtt_prefs);
+      MESH_DEBUG_PRINTLN("MQTT: /mqtt.json backup became unreadable; using defaults (files preserved)");
+    }
+    return;
+  }
+
+  if (_mqtt_prefs_hold && !fs->exists("/mqtt.json") &&
+      (fs->exists("/mqtt.json.tmp") || fs->exists("/mqtt.json.bak"))) {
+    _legacy_tail.valid = false;
+    MESH_DEBUG_PRINTLN("MQTT: unresolved /mqtt.json recovery files; using defaults (files preserved)");
+    return;
+  }
+
+  // The JSON file is authoritative once it exists. Never fall back to the
+  // stale binary snapshot when JSON is corrupt, unreadable, or from a future
+  // schema: preserve it and run defaults until an operator resolves it.
+  if (fs->exists("/mqtt.json")) {
+    const JsonPrefsLoadResult json_result =
+        adoptMqttJsonFile(fs, "/mqtt.json", &_mqtt_prefs);
+    if (jsonPrefsLoaded(json_result)) {
+      _legacy_tail.valid = false;
+      if (json_result == JsonPrefsLoadResult::LoadedWithRepairs) {
+        MESH_DEBUG_PRINTLN("MQTT: repaired out-of-range values in /mqtt.json");
+        if (!_mqtt_prefs_hold && !saveMQTTPrefs(fs)) {
+          _mqtt_prefs_hold = true;
+          MESH_DEBUG_PRINTLN("MQTT: could not persist /mqtt.json repairs; source held");
+        }
+      }
+      return;
+    }
+    _mqtt_prefs_hold = true;
+    _legacy_tail.valid = false;
+    if (json_result == JsonPrefsLoadResult::NoMemory) {
+      MESH_DEBUG_PRINTLN("MQTT: no memory to validate /mqtt.json; source preserved");
+    } else if (json_result == JsonPrefsLoadResult::UnsupportedVersion) {
+      MESH_DEBUG_PRINTLN("MQTT: /mqtt.json uses a future version; using defaults (file preserved)");
+    } else if (json_result == JsonPrefsLoadResult::FutureClaimed) {
+      MESH_DEBUG_PRINTLN(
+          "MQTT: /mqtt.json claims a future version but uses unknown grammar; "
+          "using defaults (file preserved)");
+    } else {
+      MESH_DEBUG_PRINTLN("MQTT: /mqtt.json is invalid or unreadable; using defaults (file preserved)");
+    }
+    return;
+  }
+
+  // Complete or preserve an interrupted SPIFFS transaction before decoding.
+  // A failed recovery leaves the artifacts untouched and blocks this boot from
+  // replacing them with defaults through a later CLI save.
+  _mqtt_prefs_hold = _mqtt_prefs_hold || recoverMqttPrefsFiles(fs);
+  bool has_observer_fields = false;
+  bool mqtt_rewrite_pending = false;
+  bool migrated_legacy_mqtt = false;
+
+  if (fs->exists("/mqtt_prefs")) {
+    File file = openMqttPrefsRead(fs);
+    if (file) {
+      const size_t file_size = file.size();
+      uint8_t prefix[sizeof(MQTTPrefsHeader)] = {};
+      const size_t prefix_size = file_size < sizeof(prefix) ? file_size : sizeof(prefix);
+      const size_t prefix_read = file.read(prefix, prefix_size);
+      file.close();
+
+      const MQTTPrefsCodec::DecodePlan plan =
+          MQTTPrefsCodec::classify(prefix, prefix_read, file_size);
+      if (plan.preserve_file) {
+        _mqtt_prefs_hold = true;
+        MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs is unsupported or corrupt, using defaults (file preserved)");
+      } else if (plan.source == MQTTPrefsCodec::Source::Current) {
+        file = openMqttPrefsRead(fs);
+        MQTTPrefsHeader header;
+        LegacyV1MQTTPrefs* old_prefs = new (std::nothrow) LegacyV1MQTTPrefs;
+        if (old_prefs) memset(old_prefs, 0, sizeof(*old_prefs));
+        if (!old_prefs || !file || file.read((uint8_t *)&header, sizeof(header)) != sizeof(header) ||
+            file.read((uint8_t *)old_prefs, plan.payload_len) != plan.payload_len) {
+          setMQTTPrefsDefaults(&_mqtt_prefs);
+          _mqtt_prefs_hold = true;
+          MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs read failed, using defaults (file preserved)");
+        } else if (!MQTTPrefsCodec::isPlausibleV1(*old_prefs, plan.payload_len)) {
+          setMQTTPrefsDefaults(&_mqtt_prefs);
+          _mqtt_prefs_hold = true;
+          MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs v1 content failed plausibility checks; source preserved");
+        } else {
+          MQTTPrefsCodec::migrateV1(*old_prefs, plan.payload_len, &_mqtt_prefs);
+          has_observer_fields = plan.observer_fields_present;
+          mqtt_rewrite_pending = true;
+          migrated_legacy_mqtt = true;
+          // Written by a later build with appended fields. Everything this
+          // binary knows loaded normally; say so, because the next `set` will
+          // rewrite the file at this length and drop the newer settings.
+          if (file_size - sizeof(MQTTPrefsHeader) > plan.payload_len) {
+            MESH_DEBUG_PRINTLN(
+                "MQTT: /mqtt_prefs written by newer firmware (%u > %u bytes); "
+                "known settings loaded; newer binary fields remain in the rollback snapshot",
+                (unsigned)(file_size - sizeof(MQTTPrefsHeader)),
+                (unsigned)plan.payload_len);
+          }
+        }
+        delete old_prefs;
+        if (file) file.close();
+      } else if (plan.rewrite_legacy) {
+        bool migrated = false;
+        file = openMqttPrefsRead(fs);
+        if (file) {
+          switch (plan.source) {
+            case MQTTPrefsCodec::Source::LegacyPreSlot: {
+              union {
+                OldMQTTPrefs post_wifi_power;
+                PreWifiPowerOldMQTTPrefs pre_wifi_power;
+              } old_prefs = {};
+              if (file.read((uint8_t *)&old_prefs, sizeof(old_prefs)) == sizeof(old_prefs)) {
+                if (MQTTPrefsCodec::isPlausibleLegacy(plan.source,
+                                                       (const uint8_t *)&old_prefs, sizeof(old_prefs))) {
+                  if (MQTTPrefsCodec::looksLikePreWifiPower((uint8_t *)&old_prefs, sizeof(old_prefs))) {
+                    MQTTPrefsCodec::migratePreWifiPower(old_prefs.pre_wifi_power, &_mqtt_prefs);
+                  } else {
+                    MQTTPrefsCodec::migratePreSlot(old_prefs.post_wifi_power, &_mqtt_prefs);
+                  }
+                  migrated = true;
+                } else {
+                  MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs legacy content failed plausibility checks");
+                }
+              }
+              break;
+            }
+            case MQTTPrefsCodec::Source::LegacyThreeSlotBase: {
+              ThreeSlotBaseMQTTPrefs old_prefs = {};
+              if (file.read((uint8_t *)&old_prefs, sizeof(old_prefs)) == sizeof(old_prefs)) {
+                if (MQTTPrefsCodec::isPlausibleLegacy(plan.source,
+                                                       (const uint8_t *)&old_prefs, sizeof(old_prefs))) {
+                  MQTTPrefsCodec::migrateThreeSlot(old_prefs, &_mqtt_prefs);
+                  migrated = true;
+                } else {
+                  MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs legacy content failed plausibility checks");
+                }
+              }
+              break;
+            }
+            case MQTTPrefsCodec::Source::LegacyThreeSlot: {
+              ThreeSlotMQTTPrefs old_prefs = {};
+              if (file.read((uint8_t *)&old_prefs, sizeof(old_prefs)) == sizeof(old_prefs)) {
+                if (MQTTPrefsCodec::isPlausibleLegacy(plan.source,
+                                                       (const uint8_t *)&old_prefs, sizeof(old_prefs))) {
+                  MQTTPrefsCodec::migrateThreeSlot(old_prefs, &_mqtt_prefs);
+                  migrated = true;
+                } else {
+                  MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs legacy content failed plausibility checks");
+                }
+              }
+              break;
+            }
+            case MQTTPrefsCodec::Source::LegacySixSlotBase:
+            case MQTTPrefsCodec::Source::LegacySixSlotAudience:
+            case MQTTPrefsCodec::Source::LegacySixSlotAudienceRx:
+            case MQTTPrefsCodec::Source::LegacySixSlot: {
+              Legacy6SlotMQTTPrefs* old_prefs = new (std::nothrow) Legacy6SlotMQTTPrefs;
+              if (old_prefs) memset(old_prefs, 0, sizeof(*old_prefs));
+              if (old_prefs && file.read((uint8_t *)old_prefs, plan.payload_len) == plan.payload_len) {
+                if (MQTTPrefsCodec::isPlausibleLegacy(plan.source,
+                                                       (const uint8_t *)old_prefs, plan.payload_len)) {
+                  MQTTPrefsCodec::migrateLegacySixSlot(*old_prefs, plan.source, &_mqtt_prefs);
+                  migrated = true;
+                } else {
+                  MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs legacy content failed plausibility checks");
+                }
+              }
+              delete old_prefs;
+              break;
+            }
+            default:
+              break;
+          }
+          file.close();
+        }
+        if (migrated) {
+          // Do not save yet: a legacy /com_prefs observer tail may still need
+          // to be overlaid below. Publish the complete v1 image once, after it.
+          mqtt_rewrite_pending = true;
+          migrated_legacy_mqtt = true;
+        } else {
+          setMQTTPrefsDefaults(&_mqtt_prefs);
+          _mqtt_prefs_hold = true;
+          MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs legacy read failed, using defaults (file preserved)");
+        }
+      }
+    } else {
+      _mqtt_prefs_hold = true;
+      MESH_DEBUG_PRINTLN("MQTT: /mqtt_prefs could not be opened, using defaults (file preserved)");
+    }
+  }
+
+  if (_legacy_tail.valid && !has_observer_fields) {
+    _mqtt_prefs.snmp_enabled = _legacy_tail.snmp_enabled;
+    memcpy(_mqtt_prefs.snmp_community, _legacy_tail.snmp_community, sizeof(_mqtt_prefs.snmp_community));
+    _mqtt_prefs.radio_watchdog_minutes = _legacy_tail.radio_watchdog_minutes;
+    _mqtt_prefs.alert_enabled = _legacy_tail.alert_enabled;
+    memcpy(_mqtt_prefs.alert_psk_hex, _legacy_tail.alert_psk_hex, sizeof(_mqtt_prefs.alert_psk_hex));
+    _mqtt_prefs.alert_wifi_minutes = _legacy_tail.alert_wifi_minutes;
+    _mqtt_prefs.alert_mqtt_minutes = _legacy_tail.alert_mqtt_minutes;
+    _mqtt_prefs.alert_min_interval_min = _legacy_tail.alert_min_interval_min;
+    memcpy(_mqtt_prefs.alert_hashtag, _legacy_tail.alert_hashtag, sizeof(_mqtt_prefs.alert_hashtag));
+    memcpy(_mqtt_prefs.alert_region, _legacy_tail.alert_region, sizeof(_mqtt_prefs.alert_region));
+    mqtt_rewrite_pending = true;
+    MESH_DEBUG_PRINTLN("MQTT: Migrated observer settings from legacy /com_prefs trailing block");
+  }
+
+  // Keep persisted values inside the signed-delta millis() scheduling window.
+  // This also repairs any manually-written or experimental value from firmware
+  // that briefly accepted intervals longer than the supported two-week cap.
+  if (_mqtt_prefs.mqtt_neighbors_interval < MQTT_NEIGHBORS_MIN_INTERVAL_MS ||
+      _mqtt_prefs.mqtt_neighbors_interval > MQTT_NEIGHBORS_MAX_INTERVAL_MS) {
+    _mqtt_prefs.mqtt_neighbors_interval = MQTT_NEIGHBORS_DEFAULT_INTERVAL_MS;
+    // Persist the repair so a corrupt flash value is not re-clamped every boot.
+    // Skip when hold is set so we never overwrite a deliberately preserved file.
+    if (!_mqtt_prefs_hold) {
+      mqtt_rewrite_pending = true;
+    }
+    MESH_DEBUG_PRINTLN("MQTT: invalid neighbors interval reset to %u hours",
+                       (unsigned)MQTT_NEIGHBORS_DEFAULT_INTERVAL_HOURS);
+  }
+  _legacy_tail.valid = false;
+
+  if (mqtt_rewrite_pending) {
+    legacy_upgrade->requireMqttRewrite();
+    if (migrated_legacy_mqtt) {
+      MESH_DEBUG_PRINTLN("MQTT: Migrating binary /mqtt_prefs to /mqtt.json");
+    } else {
+      MESH_DEBUG_PRINTLN("MQTT: Persisting observer tail into /mqtt.json before /com_prefs compaction");
+    }
+    if (saveMQTTPrefs(fs)) {
+      legacy_upgrade->recordMqttSave(true);
+    } else {
+      // The legacy source(s) remain intact because the failed transaction never
+      // published its temp file. Hold this boot so loadPrefs leaves /com_prefs
+      // untouched; the next boot can recover the tail and retry the transaction.
+      _mqtt_prefs_hold = true;
+      legacy_upgrade->recordMqttSave(false);
+      MESH_DEBUG_PRINTLN("MQTT: /mqtt.json migration save failed; legacy files preserved and held");
+    }
+  }
+}
+
+bool CommonCLI::saveMQTTPrefs(FILESYSTEM* fs) {
+  if (_mqtt_prefs_hold) {
+    // Loading deliberately preserved the source file. Do not replace it with this
+    // boot's defaults after an unsupported, corrupt, or temporarily failed read.
+    MESH_DEBUG_PRINTLN("MQTT: observer preference source held, not overwriting /mqtt.json");
+    return false;
+  }
+
+  MQTTPrefs* repair_defaults = new (std::nothrow) MQTTPrefs;
+  if (repair_defaults == nullptr) {
+    MESH_DEBUG_PRINTLN("MQTT: no memory to normalize observer settings before save");
+    return false;
+  }
+  setMQTTPrefsDefaults(repair_defaults);
+  MQTTPrefsSerializer serializer(&_mqtt_prefs, repair_defaults);
+  // The serializer hierarchy copies the default values it needs. Release this
+  // large temporary before file I/O and the independent verification scratch.
+  delete repair_defaults;
+  bool repaired = false;
+  if (!serializer.normalize(&repaired)) return false;
+  if (repaired) MESH_DEBUG_PRINTLN("MQTT: normalized out-of-range observer settings before save");
+
+  MQTTPrefsJsonFileStore store(fs);
+  bool verify_oom = false;
+  const MQTTPrefsAtomicStore::VerifiedImageResult result =
+      MQTTPrefsAtomicStore::writeVerifiedImage(
+          store,
+          [&]() -> bool {
+            MQTTPrefsStoreStream stream(&store);
+            return serializer.saveSerial(stream) && stream.ok();
+          },
+          [&]() -> bool {
+            MQTTPrefs* verify = new (std::nothrow) MQTTPrefs;
+            if (verify == nullptr) {
+              verify_oom = true;
+              return false;
+            }
+            const JsonPrefsLoadResult verify_result =
+                loadMqttJsonFile(fs, "/mqtt.json.tmp", verify);
+            delete verify;
+            // saveSerial() emits already-normalized values. Needing another
+            // repair here means save/load is not idempotent.
+            return verify_result == JsonPrefsLoadResult::Loaded;
+          });
+
+  // A recovery file this firmware may still promote is holding the new image,
+  // so the change cannot be reported as rolled back. No further save can start
+  // until it is resolved: begin() refuses while either the temp or the backup
+  // exists, which is exactly the state that gets us here.
+  if (MQTTPrefsAtomicStore::saveOutcomeUnresolved(result)) _observer_save_indeterminate = true;
+
+  switch (result) {
+    case MQTTPrefsAtomicStore::VerifiedImageResult::Committed:
+      return true;
+    case MQTTPrefsAtomicStore::VerifiedImageResult::BeginFailed:
+      MESH_DEBUG_PRINTLN("MQTT: atomic /mqtt.json save failed at begin; source preserved");
+      break;
+    case MQTTPrefsAtomicStore::VerifiedImageResult::WriteFailed:
+      MESH_DEBUG_PRINTLN("MQTT: atomic /mqtt.json save failed during write; source preserved");
+      break;
+    case MQTTPrefsAtomicStore::VerifiedImageResult::FinishFailed:
+      MESH_DEBUG_PRINTLN("MQTT: atomic /mqtt.json save failed during checksum verification; source preserved");
+      break;
+    case MQTTPrefsAtomicStore::VerifiedImageResult::VerifyFailed:
+      if (verify_oom) {
+        MESH_DEBUG_PRINTLN("MQTT: no memory to validate /mqtt.json temp; source preserved");
+      } else {
+        MESH_DEBUG_PRINTLN("MQTT: generated /mqtt.json temp failed schema validation; source preserved");
+      }
+      break;
+    case MQTTPrefsAtomicStore::VerifiedImageResult::CleanupIndeterminate:
+      MESH_DEBUG_PRINTLN("MQTT: rejected /mqtt.json temp could not be removed and no primary outranks it; "
+                         "recovery files preserved");
+      break;
+    case MQTTPrefsAtomicStore::VerifiedImageResult::CommitFailed:
+      MESH_DEBUG_PRINTLN("MQTT: atomic /mqtt.json save failed during rename; transaction rolled back");
+      break;
+    case MQTTPrefsAtomicStore::VerifiedImageResult::CommitIndeterminate:
+      MESH_DEBUG_PRINTLN("MQTT: atomic /mqtt.json save failed during rename and could not be rolled back; "
+                         "recovery files preserved");
+      break;
+  }
+  return false;
+}
+
+#endif
+
+#define MIN_LOCAL_ADVERT_INTERVAL   60
+
+void CommonCLI::savePrefs() {
+  uint8_t old_advert_interval = _prefs->advert_interval;
+  if (_prefs->advert_interval * 2 < MIN_LOCAL_ADVERT_INTERVAL) {
+    _prefs->advert_interval = 0;  // turn it off, now that device has been manually configured
+  }
+  // If advert_interval was changed, update the timer to reflect the change
+  if (old_advert_interval != _prefs->advert_interval) {
+    _callbacks->updateAdvertTimer();
+  }
+  _callbacks->savePrefs();
+  _prefs->clearDirty();
+}
+
+uint8_t CommonCLI::buildAdvertData(uint8_t node_type, uint8_t* app_data) {
+  if (_prefs->advert_loc_policy == ADVERT_LOC_NONE) {
+    AdvertDataBuilder builder(node_type, _prefs->node_name);
+    return builder.encodeTo(app_data);
+  } else if (_prefs->advert_loc_policy == ADVERT_LOC_SHARE) {
+    AdvertDataBuilder builder(node_type, _prefs->node_name, _sensors->node_lat, _sensors->node_lon);
+    return builder.encodeTo(app_data);
+  } else {
+    AdvertDataBuilder builder(node_type, _prefs->node_name, _prefs->node_lat, _prefs->node_lon);
+    return builder.encodeTo(app_data);
+  }
+}
+
+void CommonCLI::handleCommand(uint32_t sender_timestamp, char* command, char* reply) {
+    // Observer-only top-level commands (ota check/update, tls.bundletest, alert test)
+    // live in CommonCLI_Observer.cpp.
+    if (handleObserverCommand(sender_timestamp, command, reply)) return;
+    if (_prefs->getRadioPrefs()->handleCommand(command, sender_timestamp, reply)) {   // is a radio CLI command?
+      if (_prefs->getRadioPrefs()->isDirty()) { savePrefs(); }
+      return;
+    }
+    // hook for variant-specific CLI processing
+    if (_board->handleCommand(command, sender_timestamp, reply)) {
+      if (_prefs->isDirty()) { savePrefs(); }
+      return;
+    }
+    if (memcmp(command, "poweroff", 8) == 0 || memcmp(command, "shutdown", 8) == 0) {
+      _board->powerOff();  // doesn't return
+    } else if (memcmp(command, "reboot", 6) == 0) {
+      _board->reboot();  // doesn't return
+    } else if (memcmp(command, "clkreboot", 9) == 0) {
+      // Reset clock
+      getRTCClock()->setCurrentTime(1715770351);  // 15 May 2024, 8:50pm
+      _board->reboot();  // doesn't return
+     } else if (memcmp(command, "advert.zerohop", 14) == 0 && (command[14] == 0 || command[14] == ' ')) {
+      // send zerohop advert
+      _callbacks->sendSelfAdvertisement(1500, false);  // longer delay, give CLI response time to be sent first
+      strcpy(reply, "OK - zerohop advert sent");
+    } else if (memcmp(command, "advert", 6) == 0) {
+      // send flood advert
+      _callbacks->sendSelfAdvertisement(1500, true);  // longer delay, give CLI response time to be sent first
+      strcpy(reply, "OK - Advert sent");
+    } else if (memcmp(command, "clock sync", 10) == 0) {
+      uint32_t curr = getRTCClock()->getCurrentTime();
+      if (sender_timestamp > curr) {
+        getRTCClock()->setCurrentTime(sender_timestamp + 1);
+        uint32_t now = getRTCClock()->getCurrentTime();
+        DateTime dt = DateTime(now);
+        sprintf(reply, "OK - clock set: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+      } else {
+        strcpy(reply, "ERR: clock cannot go backwards");
+      }
+    } else if (memcmp(command, "memory", 6) == 0) {
+#ifdef ESP_PLATFORM
+      sprintf(reply, "Free: %d, Min: %d, Max: %d, Queue: %d, IntFree: %d, IntMax: %d, PSRAM: %d/%d",
+              ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(),
+              _callbacks->getQueueSize(),
+              (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+              (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+              (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+              (int)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
+#else
+      // newlib arena stats — the portable equivalent on nRF52/RP2040. There is
+      // no min-ever-free or largest-free-block counterpart, so those fields are
+      // left out rather than filled with numbers that mean something different.
+      // Frags is the free-chunk count, the closest available fragmentation hint.
+      struct mallinfo mi = mallinfo();
+      sprintf(reply, "Free: %d, Used: %d, Arena: %d, Frags: %d, Queue: %d",
+              (int)mi.fordblks, (int)mi.uordblks, (int)mi.arena, (int)mi.ordblks,
+              _callbacks->getQueueSize());
+#endif
+    } else if (memcmp(command, "start ota", 9) == 0 &&
+               (command[9] == 0 || command[9] == ' ')) {
+      // Manual OTA: bring up the ElegantOTA web UI for a hand-uploaded binary.
+      // Plain "start ota" serves on the station IP when joined to WiFi, else
+      // raises the MeshCore-OTA SoftAP. "start ota ap" forces the SoftAP even
+      // when connected, so the UI is reachable when the network applies client
+      // isolation and the station IP can't be reached.
+      bool force_ap = command[9] == ' ' && strcmp(&command[10], "ap") == 0;
+      if (command[9] == ' ' && !force_ap) {
+        strcpy(reply, "ERR: usage start ota [ap]");
+      } else {
+        reply[0] = 0;
+        if (!_board->startOTAUpdate(_prefs->node_name, reply, force_ap) &&
+            reply[0] == 0) {
+          strcpy(reply, "Error");
+        }
+      }
+    } else if (strcmp(command, "stop ota") == 0) {
+      reply[0] = 0;
+      if (!_board->stopOTAUpdate(reply) && reply[0] == 0) {
+        strcpy(reply, "ERR: OTA web server not running");
+      }
+    } else if (memcmp(command, "clock", 5) == 0) {
+      uint32_t now = getRTCClock()->getCurrentTime();
+      DateTime dt = DateTime(now);
+      sprintf(reply, "%02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+    } else if (memcmp(command, "time ", 5) == 0) {  // set time (to epoch seconds)
+      uint32_t secs = _atoi(&command[5]);
+      uint32_t curr = getRTCClock()->getCurrentTime();
+      if (secs > curr) {
+        getRTCClock()->setCurrentTime(secs);
+        uint32_t now = getRTCClock()->getCurrentTime();
+        DateTime dt = DateTime(now);
+        sprintf(reply, "OK - clock set: %02d:%02d - %d/%d/%d UTC", dt.hour(), dt.minute(), dt.day(), dt.month(), dt.year());
+      } else {
+        strcpy(reply, "(ERR: clock cannot go backwards)");
+      }
+    } else if (memcmp(command, "neighbors", 9) == 0) {
+      _callbacks->formatNeighborsReply(reply);
+    } else if (memcmp(command, "neighbor.remove ", 16) == 0) {
+      const char* hex = &command[16];
+      uint8_t pubkey[PUB_KEY_SIZE];
+      int hex_len = min((int)strlen(hex), PUB_KEY_SIZE*2);
+      int pubkey_len = hex_len / 2;
+      if (mesh::Utils::fromHex(pubkey, pubkey_len, hex)) {
+        _callbacks->removeNeighbor(pubkey, pubkey_len);
+        strcpy(reply, "OK");
+      } else {
+        strcpy(reply, "ERR: bad pubkey");
+      }
+    } else if (memcmp(command, "tempradio ", 10) == 0) {
+      strcpy(tmp, &command[10]);
+      const char *parts[5];
+      int num = mesh::Utils::parseTextParts(tmp, parts, 5);
+      float freq  = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
+      float bw    = num > 1 ? strtof(parts[1], nullptr) : 0.0f;
+      uint8_t sf  = num > 2 ? atoi(parts[2]) : 0;
+      uint8_t cr  = num > 3 ? atoi(parts[3]) : 0;
+      int temp_timeout_mins  = num > 4 ? atoi(parts[4]) : 0;
+      if (freq >= 150.0f && freq <= 2500.0f && sf >= 5 && sf <= 12 && cr >= 5 && cr <= 8 && bw >= 7.0f && bw <= 500.0f && temp_timeout_mins > 0) {
+        _callbacks->applyTempRadioParams(freq, bw, sf, cr, temp_timeout_mins);
+        sprintf(reply, "OK - temp params for %d mins", temp_timeout_mins);
+      } else {
+        strcpy(reply, "Error, invalid params");
+      }
+    } else if (memcmp(command, "password ", 9) == 0) {
+      // change admin password
+      StrHelper::strncpy(_prefs->password, &command[9], sizeof(_prefs->password));
+      savePrefs();
+      sprintf(reply, "password now: %s", _prefs->password);   // echo back just to let admin know for sure!!
+    } else if (memcmp(command, "clear stats", 11) == 0) {
+      _callbacks->clearStats();
+      strcpy(reply, "(OK - stats reset)");
+    } else if (memcmp(command, "get ", 4) == 0) {
+      handleGetCmd(sender_timestamp, command, reply);
+    } else if (memcmp(command, "set ", 4) == 0) {
+      handleSetCmd(sender_timestamp, command, reply);
+    } else if (sender_timestamp == 0 && strcmp(command, "erase") == 0) {
+      bool s = _callbacks->formatFileSystem();
+      sprintf(reply, "File system erase: %s", s ? "OK" : "Err");
+    } else if (memcmp(command, "ver", 3) == 0) {
+      sprintf(reply, "%s (Build: %s)", _callbacks->getFirmwareVer(), _callbacks->getBuildDate());
+    } else if (memcmp(command, "board", 5) == 0) {
+      sprintf(reply, "%s", _board->getManufacturerName());
+    } else if (strcmp(command, "power") == 0) {
+      const char* usb_state = _board->hasUsbPowerDetect()
+                                  ? (_board->isUsbPowered() ? "yes" : "no")
+                                  : "n/a";
+      const char* solar_state = _board->hasSolarChargerDetect()
+                                    ? (_board->isSolarChargerActive() ? "yes" : "no")
+                                    : "n/a";
+      snprintf(reply, 160, "batt:%u mV usb:%s solar_chg:%s ext:%s charger:%s",
+              (unsigned)_board->getBattMilliVolts(),
+              usb_state,
+              solar_state,
+              _board->isExternalPowered() ? "yes" : "no",
+              _board->isChargerActive() ? "yes" : "no");
+    } else if (memcmp(command, "sensor get ", 11) == 0) {
+      const char* key = command + 11;
+      const char* val = _sensors->getSettingByKey(key);
+      if (val != NULL) {
+        sprintf(reply, "> %s", val);
+      } else {
+        strcpy(reply, "null");
+      }
+    } else if (memcmp(command, "sensor set ", 11) == 0) {
+      strcpy(tmp, &command[11]);
+      const char *parts[2];
+      int num = mesh::Utils::parseTextParts(tmp, parts, 2, ' ');
+      const char *key = (num > 0) ? parts[0] : "";
+      const char *value = (num > 1) ? parts[1] : "null";
+      if (_sensors->setSettingValue(key, value)) {
+        strcpy(reply, "ok");
+      } else {
+        strcpy(reply, "can't find custom var");
+      }
+    } else if (memcmp(command, "sensor list", 11) == 0) {
+      char* dp = reply;
+      int start = 0;
+      int end = _sensors->getNumSettings();
+      if (strlen(command) > 11) {
+        start = _atoi(command+12);
+      }
+      if (start >= end) {
+        strcpy(reply, "no custom var");
+      } else {
+        sprintf(dp, "%d vars\n", end);
+        dp = strchr(dp, 0);
+        int i;
+        for (i = start; i < end && (dp-reply < 134); i++) {
+          sprintf(dp, "%s=%s\n",
+            _sensors->getSettingName(i),
+            _sensors->getSettingValue(i));
+          dp = strchr(dp, 0);
+        }
+        if (i < end) {
+          sprintf(dp, "... next:%d", i);
+        } else {
+          *(dp-1) = 0; // remove last CR
+        }
+      }
+    } else if (memcmp(command, "region", 6) == 0) {
+      handleRegionCmd(command, reply);
+#if ENV_INCLUDE_GPS == 1
+    } else if (memcmp(command, "gps on", 6) == 0) {
+      if (_sensors->setSettingValue("gps", "1")) {
+        _prefs->gps_enabled = 1;
+        savePrefs();
+        strcpy(reply, "ok");
+      } else {
+        strcpy(reply, "gps toggle not found");
+      }
+    } else if (memcmp(command, "gps off", 7) == 0) {
+      if (_sensors->setSettingValue("gps", "0")) {
+        _prefs->gps_enabled = 0;
+        savePrefs();
+        strcpy(reply, "ok");
+      } else {
+        strcpy(reply, "gps toggle not found");
+      }
+    } else if (memcmp(command, "gps sync", 8) == 0) {
+      LocationProvider * l = _sensors->getLocationProvider();
+      if (l != NULL) {
+        l->syncTime();
+        strcpy(reply, "ok");
+      } else {
+        strcpy(reply, "gps provider not found");
+      }
+    } else if (strcmp(command, "gps diag") == 0) {
+      LocationProvider * l = _sensors->getLocationProvider();
+      if (l != NULL) {
+        const char* setting = _sensors->getSettingByKey("gps");
+        bool requested = setting != NULL && strcmp(setting, "1") == 0;
+        int prefix_len = snprintf(reply, 160, "req:%u ", requested ? 1U : 0U);
+        if (prefix_len < 0 || prefix_len >= 160) {
+          reply[159] = 0;
+        } else {
+          l->formatDiagnostics(reply + prefix_len, 160 - prefix_len);
+        }
+      } else {
+        strcpy(reply, "gps provider not found");
+      }
+    } else if (memcmp(command, "gps setloc", 10) == 0) {
+      _prefs->node_lat = _sensors->node_lat;
+      _prefs->node_lon = _sensors->node_lon;
+      savePrefs();
+      strcpy(reply, "ok");
+    } else if (memcmp(command, "gps advert", 10) == 0) {
+      if (strlen(command) == 10) {
+        switch (_prefs->advert_loc_policy) {
+          case ADVERT_LOC_NONE:
+            strcpy(reply, "> none");
+            break;
+          case ADVERT_LOC_PREFS:
+            strcpy(reply, "> prefs");
+            break;
+          case ADVERT_LOC_SHARE:
+            strcpy(reply, "> share");
+            break;
+          default:
+            strcpy(reply, "error");
+        }
+      } else if (memcmp(command+11, "none", 4) == 0) {
+        _prefs->advert_loc_policy = ADVERT_LOC_NONE;
+        savePrefs();
+        strcpy(reply, "ok");
+      } else if (memcmp(command+11, "share", 5) == 0) {
+        _prefs->advert_loc_policy = ADVERT_LOC_SHARE;
+        savePrefs();
+        strcpy(reply, "ok");
+      } else if (memcmp(command+11, "prefs", 5) == 0) {
+        _prefs->advert_loc_policy = ADVERT_LOC_PREFS;
+        savePrefs();
+        strcpy(reply, "ok");
+      } else {
+        strcpy(reply, "error");
+      }
+    } else if (memcmp(command, "gps", 3) == 0) {
+      LocationProvider * l = _sensors->getLocationProvider();
+      if (l != NULL) {
+        bool enabled = l->isEnabled(); // is EN pin on ?
+        bool fix = l->isValid();       // has fix ?
+        int sats = l->satellitesCount();
+        bool active = !strcmp(_sensors->getSettingByKey("gps"), "1");
+        if (enabled) {
+          sprintf(reply, "on, %s, %s, %d sats",
+            active?"active":"deactivated",
+            fix?"fix":"no fix",
+            sats);
+        } else {
+          strcpy(reply, "off");
+        }
+      } else {
+        strcpy(reply, "Can't find GPS");
+      }
+#endif
+    } else if (memcmp(command, "powersaving on", 14) == 0) {
+#if defined(NRF52_PLATFORM)
+      _prefs->powersaving_enabled = 1;
+      savePrefs();
+      strcpy(reply, "on - Immediate effect");
+#elif defined(ESP32) && !defined(WITH_BRIDGE)
+      _prefs->powersaving_enabled = 1;
+      savePrefs();
+      strcpy(reply, "on - After 2 minutes");
+#elif defined(WITH_BRIDGE)
+      strcpy(reply, "Bridge not supported");
+#else
+      strcpy(reply, "Board not supported");
+#endif
+    } else if (memcmp(command, "powersaving off", 15) == 0) {
+      _prefs->powersaving_enabled = 0;
+      savePrefs();
+      strcpy(reply, "off");
+    } else if (memcmp(command, "powersaving", 11) == 0) {
+      if (_prefs->powersaving_enabled) {
+        strcpy(reply, "on");
+      } else {
+        strcpy(reply, "off");
+      }
+    } else if (memcmp(command, "log start", 9) == 0) {
+      _callbacks->setLoggingOn(true);
+      strcpy(reply, "   logging on");
+    } else if (memcmp(command, "log stop", 8) == 0) {
+      _callbacks->setLoggingOn(false);
+      strcpy(reply, "   logging off");
+    } else if (memcmp(command, "log erase", 9) == 0) {
+      _callbacks->eraseLogFile();
+      strcpy(reply, "   log erased");
+    } else if (sender_timestamp == 0 && memcmp(command, "log", 3) == 0) {
+      _callbacks->dumpLogFile();
+      strcpy(reply, "   EOF");
+    } else if (sender_timestamp == 0 && memcmp(command, "stats-packets", 13) == 0 && (command[13] == 0 || command[13] == ' ')) {
+      _callbacks->formatPacketStatsReply(reply);
+    } else if (sender_timestamp == 0 && memcmp(command, "stats-radio-diag", 16) == 0 && (command[16] == 0 || command[16] == ' ')) {
+      _callbacks->formatRadioDiagReply(reply);
+    } else if (sender_timestamp == 0 && memcmp(command, "stats-radio", 11) == 0 && (command[11] == 0 || command[11] == ' ')) {
+      _callbacks->formatRadioStatsReply(reply);
+    } else if (sender_timestamp == 0 && memcmp(command, "stats-core", 10) == 0 && (command[10] == 0 || command[10] == ' ')) {
+      _callbacks->formatStatsReply(reply);
+    } else {
+      strcpy(reply, "Unknown command");
+    }
+}
+
+void CommonCLI::handleSetCmd(uint32_t sender_timestamp, char* command, char* reply) {
+  const char* config = &command[4];
+  // Observer/MQTT/WiFi/timezone/alert/SNMP commands live in CommonCLI_Observer.cpp.
+  if (handleObserverSetCmd(sender_timestamp, config, reply)) return;
+  if (memcmp(config, "allow.read.only ", 16) == 0) {
+    _prefs->allow_read_only = memcmp(&config[16], "on", 2) == 0;
+    savePrefs();
+    strcpy(reply, "OK");
+  } else if (memcmp(config, "flood.advert.interval ", 22) == 0) {
+    int hours = _atoi(&config[22]);
+    if ((hours > 0 && hours < 3) || (hours > 168)) {
+      strcpy(reply, "Error: interval range is 3-168 hours");
+    } else {
+      _prefs->flood_advert_interval = (uint8_t)(hours);
+      _callbacks->updateFloodAdvertTimer();
+      savePrefs();
+      strcpy(reply, "OK");
+    }
+  } else if (memcmp(config, "advert.interval ", 16) == 0) {
+    int mins = _atoi(&config[16]);
+    if ((mins > 0 && mins < MIN_LOCAL_ADVERT_INTERVAL) || (mins > 240)) {
+      sprintf(reply, "Error: interval range is %d-240 minutes", MIN_LOCAL_ADVERT_INTERVAL);
+    } else {
+      _prefs->advert_interval = (uint8_t)(mins / 2);
+      _callbacks->updateAdvertTimer();
+      savePrefs();
+      strcpy(reply, "OK");
+    }
+  } else if (memcmp(config, "guest.password ", 15) == 0) {
+    StrHelper::strncpy(_prefs->guest_password, &config[15], sizeof(_prefs->guest_password));
+    savePrefs();
+    strcpy(reply, "OK");
+  } else if (memcmp(config, "prv.key ", 8) == 0) {
+    uint8_t prv_key[PRV_KEY_SIZE];
+    bool success = mesh::Utils::fromHex(prv_key, PRV_KEY_SIZE, &config[8]);
+    // only allow rekey if key is valid
+    if (success && mesh::LocalIdentity::validatePrivateKey(prv_key)) {
+      mesh::LocalIdentity new_id;
+      new_id.readFrom(prv_key, PRV_KEY_SIZE);
+      _callbacks->saveIdentity(new_id);
+      strcpy(reply, "OK, reboot to apply! New pubkey: ");
+      mesh::Utils::toHex(&reply[33], new_id.pub_key, PUB_KEY_SIZE);
+    } else {
+      strcpy(reply, "Error, bad key");
+    }
+  } else if (memcmp(config, "name ", 5) == 0) {
+    if (isValidName(&config[5])) {
+      StrHelper::strncpy(_prefs->node_name, &config[5], sizeof(_prefs->node_name));
+      savePrefs();
+      _callbacks->onNodeNameChanged();
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Error, bad chars");
+    }
+  } else if (memcmp(config, "repeat ", 7) == 0) {
+    _prefs->disable_fwd = memcmp(&config[7], "off", 3) == 0;
+    savePrefs();
+    strcpy(reply, _prefs->disable_fwd ? "OK - repeat is now OFF" : "OK - repeat is now ON");
+  } else if (memcmp(config, "lat ", 4) == 0) {
+    _prefs->node_lat = atof(&config[4]);
+    savePrefs();
+    strcpy(reply, "OK");
+  } else if (memcmp(config, "lon ", 4) == 0) {
+    _prefs->node_lon = atof(&config[4]);
+    savePrefs();
+    strcpy(reply, "OK");
+  } else if (memcmp(config, "flood.max.unscoped ", 19) == 0) {
+    uint8_t m = atoi(&config[19]);
+    if (m <= 64) {
+      _prefs->flood_max_unscoped = m;
+      savePrefs();
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Error, max 64");
+    } 
+  } else if (memcmp(config, "flood.max.advert ", 17) == 0) {
+    uint8_t m = atoi(&config[17]);
+    if (m <= 64) {
+      _prefs->flood_max_advert = m;
+      savePrefs();
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Error, max 64");
+    }
+  } else if (memcmp(config, "flood.max ", 10) == 0) {
+    uint8_t m = atoi(&config[10]);
+    if (m <= 64) {
+      _prefs->flood_max = m;
+      savePrefs();
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Error, max 64");
+    }
+  } else if (memcmp(config, "owner.info ", 11) == 0) {
+    config += 11;
+    char *dp = _prefs->owner_info;
+    while (*config && dp - _prefs->owner_info < sizeof(_prefs->owner_info)-1) {
+      *dp++ = (*config == '|') ? '\n' : *config;    // translate '|' to newline chars
+      config++;
+    }
+    *dp = 0;
+    savePrefs();
+    strcpy(reply, "OK");
+  } else if (memcmp(config, "loop.detect ", 12) == 0) {
+    config += 12;
+    uint8_t mode;
+    if (memcmp(config, "off", 3) == 0) {
+      mode = LOOP_DETECT_OFF;
+    } else if (memcmp(config, "minimal", 7) == 0) {
+      mode = LOOP_DETECT_MINIMAL;
+    } else if (memcmp(config, "moderate", 8) == 0) {
+      mode = LOOP_DETECT_MODERATE;
+    } else if (memcmp(config, "strict", 6) == 0) {
+      mode = LOOP_DETECT_STRICT;
+    } else {
+      mode = 0xFF;
+      strcpy(reply, "Error, must be: off, minimal, moderate, or strict");
+    }
+    if (mode != 0xFF) {
+      _prefs->loop_detect = mode;
+      savePrefs();
+      strcpy(reply, "OK");
+    }
+  } else if (sender_timestamp == 0 && memcmp(config, "freq ", 5) == 0) {
+    _prefs->freq = atof(&config[5]);
+    savePrefs();
+    strcpy(reply, "OK - reboot to apply");
+#ifdef WITH_BRIDGE
+  } else if (memcmp(config, "bridge.enabled ", 15) == 0) {
+    _prefs->bridge_enabled = memcmp(&config[15], "on", 2) == 0;
+    _callbacks->setBridgeState(_prefs->bridge_enabled);
+    savePrefs();
+    strcpy(reply, "OK");
+  } else if (memcmp(config, "bridge.delay ", 13) == 0) {
+    int delay = _atoi(&config[13]);
+    if (delay >= 0 && delay <= 10000) {
+      _prefs->bridge_delay = (uint16_t)delay;
+      savePrefs();
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Error: delay must be between 0-10000 ms");
+    }
+  } else if (memcmp(config, "bridge.source ", 14) == 0) {
+#ifdef WITH_MQTT_BRIDGE
+    MQTTPrefs* observer_rollback = new (std::nothrow) MQTTPrefs;
+    if (observer_rollback == nullptr) {
+      strcpy(reply, "Error: insufficient memory to update observer setting");
+      return;
+    }
+    memcpy(observer_rollback, &_mqtt_prefs, sizeof(*observer_rollback));
+    const uint8_t old_bridge_pkt_src = _prefs->bridge_pkt_src;
+#endif
+    _prefs->bridge_pkt_src = memcmp(&config[14], "rx", 2) == 0;
+#ifdef WITH_MQTT_BRIDGE
+    if (_prefs->bridge_pkt_src == 1) {
+      _mqtt_prefs.mqtt_rx_enabled = 1;
+      _mqtt_prefs.mqtt_tx_enabled = 0;
+    } else {
+      _mqtt_prefs.mqtt_rx_enabled = 0;
+      _mqtt_prefs.mqtt_tx_enabled = 1;
+    }
+    _observer_prefs_rollback = observer_rollback;
+    if (!persistObserverPrefs(reply)) {
+      _prefs->bridge_pkt_src = old_bridge_pkt_src;
+      _observer_prefs_rollback = nullptr;
+      delete observer_rollback;
+      return;
+    }
+    _observer_prefs_rollback = nullptr;
+    delete observer_rollback;
+#endif
+    savePrefs();
+    strcpy(reply, "OK");
+#endif
+#ifdef WITH_RS232_BRIDGE
+  } else if (memcmp(config, "bridge.baud ", 12) == 0) {
+    uint32_t baud = atoi(&config[12]);
+    if (baud >= 9600 && baud <= BRIDGE_MAX_BAUD) {
+      _prefs->bridge_baud = (uint32_t)baud;
+      _callbacks->restartBridge();
+      savePrefs();
+      strcpy(reply, "OK");
+    } else {
+      sprintf(reply, "Error: baud rate must be between 9600-%d",BRIDGE_MAX_BAUD);
+    }
+#endif
+#ifdef WITH_ESPNOW_BRIDGE
+  } else if (memcmp(config, "bridge.channel ", 15) == 0) {
+    int ch = atoi(&config[15]);
+    if (ch > 0 && ch < 15) {
+      _prefs->bridge_channel = (uint8_t)ch;
+      _callbacks->restartBridge();
+      savePrefs();
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Error: channel must be between 1-14");
+    }
+  } else if (memcmp(config, "bridge.secret ", 14) == 0) {
+    StrHelper::strncpy(_prefs->bridge_secret, &config[14], sizeof(_prefs->bridge_secret));
+    _callbacks->restartBridge();
+    savePrefs();
+    strcpy(reply, "OK");
+#endif
+  } else if (memcmp(config, "adc.multiplier ", 15) == 0) {
+    _prefs->adc_multiplier = atof(&config[15]);
+    if (_board->setAdcMultiplier(_prefs->adc_multiplier)) {
+      savePrefs();
+      if (_prefs->adc_multiplier == 0.0f) {
+        strcpy(reply, "OK - using default board multiplier");
+      } else {
+        sprintf(reply, "OK - multiplier set to %.3f", _prefs->adc_multiplier);
+      }
+    } else {
+      _prefs->adc_multiplier = 0.0f;
+      strcpy(reply, "Error: unsupported");
+    };
+  #if defined(USE_LR2021)
+  } else if (memcmp(config, "extra.sf ", 9) == 0) {
+    strcpy(tmp, &config[9]);
+    const char *parts[4];
+    uint8_t sideDetSFs[4];
+    int num = mesh::Utils::parseTextParts(tmp, parts, 4);
+    if (num > 3) {
+      sprintf(reply, "Invalid extra SF config");
+    } else {
+      for (int i = 0; i < num; i++) {
+        sideDetSFs[i] = atoi(parts[i]);
+      }
+      sideDetSFs[num] = 0;
+      if (_callbacks->configSideDetectors(sideDetSFs, num, _prefs->bw)) {
+        for (int i = 0; i <= num; i++) _prefs->extra_sf[i] = sideDetSFs[i];
+        savePrefs();
+        sprintf(reply, "OK - extra SFs set");
+      } else {
+        sprintf(reply, "Invalid extra SF config");
+      }
+    }
+  #endif
+  } else {
+    sprintf(reply, "unknown config: %s", config);
+  }
+}
+
+void CommonCLI::handleGetCmd(uint32_t sender_timestamp, char* command, char* reply) {
+  const char* config = &command[4];
+  // Observer/MQTT/WiFi/timezone/alert/SNMP commands live in CommonCLI_Observer.cpp.
+  if (handleObserverGetCmd(sender_timestamp, config, reply)) return;
+  if (memcmp(config, "allow.read.only", 15) == 0) {
+    sprintf(reply, "> %s", _prefs->allow_read_only ? "on" : "off");
+  } else if (memcmp(config, "flood.advert.interval", 21) == 0) {
+    sprintf(reply, "> %d", ((uint32_t) _prefs->flood_advert_interval));
+  } else if (memcmp(config, "advert.interval", 15) == 0) {
+    sprintf(reply, "> %d", ((uint32_t) _prefs->advert_interval) * 2);
+  } else if (memcmp(config, "guest.password", 14) == 0) {
+    sprintf(reply, "> %s", _prefs->guest_password);
+  } else if (sender_timestamp == 0 && memcmp(config, "prv.key", 7) == 0) {  // from serial command line only
+    uint8_t prv_key[PRV_KEY_SIZE];
+    int len = _callbacks->getSelfId().writeTo(prv_key, PRV_KEY_SIZE);
+    mesh::Utils::toHex(tmp, prv_key, len);
+    sprintf(reply, "> %s", tmp);
+  } else if (memcmp(config, "name", 4) == 0) {
+    sprintf(reply, "> %s", _prefs->node_name);
+  } else if (memcmp(config, "repeat", 6) == 0) {
+    sprintf(reply, "> %s", _prefs->disable_fwd ? "off" : "on");
+  } else if (memcmp(config, "lat", 3) == 0) {
+    sprintf(reply, "> %s", StrHelper::ftoa(_prefs->node_lat));
+  } else if (memcmp(config, "lon", 3) == 0) {
+    sprintf(reply, "> %s", StrHelper::ftoa(_prefs->node_lon));
+  } else if (memcmp(config, "flood.max.advert", 16) == 0) {
+    sprintf(reply, "> %d", (uint32_t)_prefs->flood_max_advert);
+  } else if (memcmp(config, "flood.max.unscoped", 18) == 0) {
+    sprintf(reply, "> %d", (uint32_t)_prefs->flood_max_unscoped);
+  } else if (memcmp(config, "flood.max", 9) == 0) {
+    sprintf(reply, "> %d", (uint32_t)_prefs->flood_max);
+  } else if (memcmp(config, "owner.info", 10) == 0) {
+    *reply++ = '>';
+    *reply++ = ' ';
+    const char* sp = _prefs->owner_info;
+    while (*sp) {
+      *reply++ = (*sp == '\n') ? '|' : *sp;    // translate newline back to orig '|'
+      sp++;
+    }
+    *reply = 0;  // set null terminator
+  } else if (memcmp(config, "loop.detect", 11) == 0) {
+    if (_prefs->loop_detect == LOOP_DETECT_OFF) {
+      strcpy(reply, "> off");
+    } else if (_prefs->loop_detect == LOOP_DETECT_MINIMAL) {
+      strcpy(reply, "> minimal");
+    } else if (_prefs->loop_detect == LOOP_DETECT_MODERATE) {
+      strcpy(reply, "> moderate");
+    } else {
+      strcpy(reply, "> strict");
+    }
+  } else if (memcmp(config, "public.key", 10) == 0) {
+    strcpy(reply, "> ");
+    mesh::Utils::toHex(&reply[2], _callbacks->getSelfId().pub_key, PUB_KEY_SIZE);
+  } else if (memcmp(config, "role", 4) == 0) {
+    sprintf(reply, "> %s", _callbacks->getRole());
+  } else if (memcmp(config, "bridge.type", 11) == 0) {
+    sprintf(reply, "> %s",
+#ifdef WITH_RS232_BRIDGE
+            "rs232"
+#elif WITH_ESPNOW_BRIDGE
+            "espnow"
+#else
+            "none"
+#endif
+    );
+#ifdef WITH_BRIDGE
+  } else if (memcmp(config, "bridge.enabled", 14) == 0) {
+    sprintf(reply, "> %s", _prefs->bridge_enabled ? "on" : "off");
+  } else if (memcmp(config, "bridge.delay", 12) == 0) {
+    sprintf(reply, "> %d", (uint32_t)_prefs->bridge_delay);
+  } else if (memcmp(config, "bridge.source", 13) == 0) {
+    sprintf(reply, "> %s", _prefs->bridge_pkt_src ? "logRx" : "logTx");
+#endif
+#ifdef WITH_RS232_BRIDGE
+  } else if (memcmp(config, "bridge.baud", 11) == 0) {
+    sprintf(reply, "> %d", (uint32_t)_prefs->bridge_baud);
+#endif
+#ifdef WITH_ESPNOW_BRIDGE
+  } else if (memcmp(config, "bridge.channel", 14) == 0) {
+    sprintf(reply, "> %d", (uint32_t)_prefs->bridge_channel);
+  } else if (memcmp(config, "bridge.secret", 13) == 0) {
+    sprintf(reply, "> %s", _prefs->bridge_secret);
+#endif
+  } else if (memcmp(config, "bootloader.ver", 14) == 0) {
+  #ifdef NRF52_PLATFORM
+      char ver[32];
+      if (_board->getBootloaderVersion(ver, sizeof(ver))) {
+          sprintf(reply, "> %s", ver);
+      } else {
+          strcpy(reply, "> unknown");
+      }
+  #else
+      strcpy(reply, "Error: unsupported");
+  #endif
+  } else if (memcmp(config, "adc.multiplier", 14) == 0) {
+    float adc_mult = _board->getAdcMultiplier();
+    if (adc_mult == 0.0f) {
+      strcpy(reply, "Error: unsupported");
+    } else {
+      sprintf(reply, "> %.3f", adc_mult);
+    }
+  // Power management commands
+  } else if (memcmp(config, "pwrmgt.support", 14) == 0) {
+#ifdef NRF52_POWER_MANAGEMENT
+    strcpy(reply, "> supported");
+#else
+    strcpy(reply, "> unsupported");
+#endif
+  } else if (memcmp(config, "pwrmgt.source", 13) == 0) {
+#ifdef NRF52_POWER_MANAGEMENT
+    strcpy(reply, _board->isExternalPowered() ? "> external" : "> battery");
+#else
+    strcpy(reply, "ERROR: Power management not supported");
+#endif
+  } else if (memcmp(config, "pwrmgt.bootreason", 17) == 0) {
+    sprintf(reply, "> Reset: %s; Shutdown: %s",
+      _board->getResetReasonString(_board->getResetReason()),
+      _board->getShutdownReasonString(_board->getShutdownReason()));
+  } else if (memcmp(config, "pwrmgt.bootmv", 13) == 0) {
+#ifdef NRF52_POWER_MANAGEMENT
+    sprintf(reply, "> %u mV", _board->getBootVoltage());
+#else
+    strcpy(reply, "ERROR: Power management not supported");
+#endif
+  } else if (memcmp(config, "extra.sf", 8) == 0) {
+    char* tmp = reply;
+    for (int i = 0; i < 3 && _prefs->extra_sf[i] != 0; i++) {
+      tmp += sprintf(tmp, "%s%d", (i == 0) ? "" : ",", _prefs->extra_sf[i]);
+    } 
+    if (tmp == reply) {
+      sprintf(reply, "No extra SF configured");
+    }
+  } else {
+    sprintf(reply, "??: %s", config);
+  }
+}
+
+static char* skipSpaces(char* s) {
+  while (*s == ' ') s++;
+  return s;
+}
+
+static void rtrimSpaces(char* s) {
+  char* e = s + strlen(s);
+  while (e > s && e[-1] == ' ') *--e = '\0';
+}
+
+static char* takeToken(char** cursor) {
+  char* p = skipSpaces(*cursor);
+  if (*p == '\0') { *cursor = p; return nullptr; }
+  char* tok = p;
+  while (*p && *p != ' ') p++;
+  if (*p) *p++ = '\0';
+  *cursor = p;
+  return tok;
+}
+
+static char* splitNameJump(char* tok) {
+  for (char* q = tok; *q; q++) {
+    if (*q == '|' || *q == ',') {
+      *q = '\0';
+      char* jump = skipSpaces(q + 1);
+      rtrimSpaces(jump);
+      return jump;
+    }
+  }
+  return nullptr;
+}
+
+static bool processRegionDefSegment(RegionMap* map, char* tok, RegionEntry** cursor, char* reply) {
+  char* jump = splitNameJump(tok);
+  char* name = skipSpaces(tok);
+  if (*name == '\0') { snprintf(reply, 160, "Err - empty name"); return false; }
+  if (jump && *jump == '\0') { snprintf(reply, 160, "Err - empty jump"); return false; }
+
+  RegionEntry* r = map->putRegion(name, (*cursor)->id);
+  if (r == NULL) { snprintf(reply, 160, "Err - put failed: %s", name); return false; }
+  r->flags = 0;
+
+  if (jump) {
+    RegionEntry* j = map->findByNamePrefix(jump);
+    if (j == NULL) { snprintf(reply, 160, "Err - unknown jump: %s", jump); return false; }
+    *cursor = j;
+  } else {
+    *cursor = r;
+  }
+  return true;
+}
+
+void CommonCLI::handleRegionCmd(char* command, char* reply) {
+  reply[0] = 0;
+
+  // `region def`: must run before parseTextParts mutates the buffer
+  char* cmd = skipSpaces(command);
+  if (strncmp(cmd, "region def", 10) == 0 && (cmd[10] == ' ' || cmd[10] == '\0')) {
+    char* payload = skipSpaces(cmd + 10);
+    rtrimSpaces(payload);
+    if (*payload == '\0') { snprintf(reply, 160, "Err - empty def"); return; }
+
+    RegionEntry* cursor = &_region_map->getWildcard();
+    for (char* tok; (tok = takeToken(&payload)) != nullptr; ) {
+      if (!processRegionDefSegment(_region_map, tok, &cursor, reply)) return;
+    }
+    _region_map->exportTo(reply, 160);
+    return;
+  }
+
+  const char* parts[4];
+  int n = mesh::Utils::parseTextParts(command, parts, 4, ' ');
+  if (n == 1) {
+    _region_map->exportTo(reply, 160);
+  } else if (n >= 2 && strcmp(parts[1], "load") == 0) {
+    _callbacks->startRegionsLoad();
+  } else if (n >= 2 && strcmp(parts[1], "save") == 0) {
+    _prefs->discovery_mod_timestamp = getRTCClock()->getCurrentTime();   // this node is now 'modified' (for discovery info)
+    savePrefs();
+    bool success = _callbacks->saveRegions();
+    strcpy(reply, success ? "OK" : "Err - save failed");
+  } else if (n >= 3 && strcmp(parts[1], "allowf") == 0) {
+    auto region = _region_map->findByNamePrefix(parts[2]);
+    if (region) {
+      region->flags &= ~REGION_DENY_FLOOD;
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Err - unknown region");
+    }
+  } else if (n >= 3 && strcmp(parts[1], "denyf") == 0) {
+    auto region = _region_map->findByNamePrefix(parts[2]);
+    if (region) {
+      region->flags |= REGION_DENY_FLOOD;
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Err - unknown region");
+    }
+  } else if (n >= 3 && strcmp(parts[1], "get") == 0) {
+    auto region = _region_map->findByNamePrefix(parts[2]);
+    if (region) {
+      auto parent = _region_map->findById(region->parent);
+      if (parent && parent->id != 0) {
+        sprintf(reply, " %s (%s) %s", region->name, parent->name, (region->flags & REGION_DENY_FLOOD) ? "" : "F");
+      } else {
+        sprintf(reply, " %s %s", region->name, (region->flags & REGION_DENY_FLOOD) ? "" : "F");
+      }
+    } else {
+      strcpy(reply, "Err - unknown region");
+    }
+  } else if (n >= 3 && strcmp(parts[1], "home") == 0) {
+    auto home = _region_map->findByNamePrefix(parts[2]);
+    if (home) {
+      _region_map->setHomeRegion(home);
+      sprintf(reply, " home is now %s", home->name);
+    } else {
+      strcpy(reply, "Err - unknown region");
+    }
+  } else if (n == 2 && strcmp(parts[1], "home") == 0) {
+    auto home = _region_map->getHomeRegion();
+    sprintf(reply, " home is %s", home ? home->name : "*");
+  } else if (n >= 3 && strcmp(parts[1], "default") == 0) {
+    if (strcmp(parts[2], "<null>") == 0) {
+      _region_map->setDefaultRegion(NULL);
+      _callbacks->onDefaultRegionChanged(NULL);
+      _callbacks->saveRegions();  // persist in one atomic step
+      sprintf(reply, " default scope is now <null>");
+    } else {
+      auto def = _region_map->findByNamePrefix(parts[2]);
+      if (def == NULL) {
+        def = _region_map->putRegion(parts[2], 0);  // auto-create the default region
+      }
+      if (def) {
+        def->flags = 0;   // make sure allow flood enabled
+        _region_map->setDefaultRegion(def);
+        _callbacks->onDefaultRegionChanged(def);
+        _callbacks->saveRegions();  // persist in one atomic step
+        sprintf(reply, " default scope is now %s", def->name);
+      } else {
+        strcpy(reply, "Err - region table full");
+      }
+    }
+  } else if (n == 2 && strcmp(parts[1], "default") == 0) {
+    auto def = _region_map->getDefaultRegion();
+    sprintf(reply, " default scope is %s", def ? def->name : "<null>");
+  } else if (n >= 3 && strcmp(parts[1], "put") == 0) {
+    auto parent = n >= 4 ? _region_map->findByNamePrefix(parts[3]) : &(_region_map->getWildcard());
+    if (parent == NULL) {
+      strcpy(reply, "Err - unknown parent");
+    } else {
+      auto region = _region_map->putRegion(parts[2], parent->id);
+      if (region == NULL) {
+        strcpy(reply, "Err - unable to put");
+      } else {
+        region->flags = 0;   // New default: enable flood
+        strcpy(reply, "OK - (flood allowed)");
+      }
+    }
+  } else if (n >= 3 && strcmp(parts[1], "remove") == 0) {
+    auto region = _region_map->findByName(parts[2]);
+    if (region) {
+      if (_region_map->removeRegion(*region)) {
+        strcpy(reply, "OK");
+      } else {
+        strcpy(reply, "Err - not empty");
+      }
+    } else {
+      strcpy(reply, "Err - not found");
+    }
+  } else if (n >= 3 && strcmp(parts[1], "list") == 0) {
+    uint8_t mask = 0;
+    bool invert = false;
+    
+    if (strcmp(parts[2], "allowed") == 0) {
+      mask = REGION_DENY_FLOOD;
+      invert = false;  // list regions that DON'T have DENY flag
+    } else if (strcmp(parts[2], "denied") == 0) {
+      mask = REGION_DENY_FLOOD;
+      invert = true;   // list regions that DO have DENY flag
+    } else {
+      strcpy(reply, "Err - use 'allowed' or 'denied'");
+      return;
+    }
+    
+    int len = _region_map->exportNamesTo(reply, 160, mask, invert);
+    if (len == 0) {
+      strcpy(reply, "-none-");
+    }
+  } else {
+    strcpy(reply, "Err - ??");
+  }
+}

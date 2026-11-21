@@ -1,0 +1,13 @@
+{
+  "name": "meshcore-bot-mqtt-extras",
+  "version": "0.1.0",
+  "description": "Extra commands for the MeshCore bot over MQTT: Zork I and dad jokes",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "fetch-story": "mkdir -p story && curl -fL -o story/zork1.z3 https://raw.githubusercontent.com/historicalsource/zork1/HEAD/COMPILED/zork1.z3 && curl -fL -o story/LICENSE-zork1.txt https://raw.githubusercontent.com/historicalsource/zork1/HEAD/LICENSE"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": { "mqtt": "^5.10.1" }
+}
