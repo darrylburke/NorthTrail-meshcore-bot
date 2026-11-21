@@ -100,8 +100,8 @@ code{overflow-wrap:anywhere}
 <label>Region scope</label><input id="c_scope" maxlength="30">
 <div class="row"><div><label>Command prefix</label><input id="c_prefix" maxlength="1"></div>
 <div><label>Cooldown per sender (seconds)</label><input id="c_cooldown_s" type="number" min="0" max="3600"></div></div>
-<label class="chk"><input type="checkbox" id="c_bare"> Also answer commands written without the prefix</label>
-<p class="note">With this on, <code>ping</code> works like <code>!ping</code> in channels (direct messages never need the prefix for the bot's own commands), and a command from the broker also works without it, in channels and direct messages. Only a message that starts with the name of a command is answered, so a chat line that happens to start with one (“test again later”) is answered too.</p>
+<label class="chk"><input type="checkbox" id="c_bare"> Also answer commands from the broker written without the prefix</label>
+<p class="note">For the bot's own commands, the text each one answers to is set beside it, under Built-in commands and Custom commands.</p>
 <label>Replies per minute, at most</label><input id="c_max_per_min" type="number" min="1" max="30">
 <label>Ignore senders whose name contains (comma separated)</label><input id="c_ignore" maxlength="95">
 <div class="row"><div><label>Latitude</label><input id="c_lat" inputmode="decimal"></div>
@@ -120,6 +120,7 @@ code{overflow-wrap:anywhere}
 </section>
 
 <section><h2>Built-in commands</h2>
+<p class="note">Each box holds the exact text the command answers to at the start of a message: the name with the prefix, without it, or both, separated by a comma (<code>!ping, ping</code>). A name is 1 to 16 letters or digits, and one command has one name. Listing the bare word means a chat line that starts with it (“test again later”) is answered too. A direct message is answered in either form. For a different wording, add a text rule.</p>
 <p class="note">wx &lt;place&gt; sends the typed place name to Open-Meteo.</p>
 <div id="b_list"></div>
 <button id="b_save">Save built-in commands</button><div id="b_msg" class="msg"></div></section>
@@ -398,16 +399,28 @@ function settings(){const c=C;
   const z=$("c_tz");z.textContent="";const list=ZONES.indexOf(c.tz)<0&&c.tz?ZONES.concat([c.tz]):ZONES;
   list.forEach(t=>z.appendChild(el("option",{value:t,textContent:t})));z.value=c.tz||"UTC";$("c_bare").checked=c.bare===true;channels()}
 
+// ---- the exact text a command answers to: "<prefix>name", "name", or both ----
+function formsText(name,pfx,bare){const p=(C&&C.prefix)||"!",f=[];if(pfx!==false)f.push(p+name);if(bare===true)f.push(name);return f.join(", ")}
+// {name,pfx,bare} from what was typed, or {error}.
+function formsParse(text){const p=(C&&C.prefix)||"!",o={name:"",pfx:false,bare:false};
+  const toks=text.split(/[,\s]+/).filter(t=>t);
+  if(!toks.length)return{error:"enter the text it answers to, such as "+p+"ping or ping"};
+  for(const t of toks){const has=t[0]===p,w=(has?t.slice(1):t).toLowerCase();
+    if(!/^[a-z0-9]{1,16}$/.test(w))return{error:"“"+t+"” is not a name of 1 to 16 letters or digits, with or without the prefix "+p};
+    if(o.name&&o.name!==w)return{error:"one command has one name (“"+o.name+"” and “"+w+"” differ); use a text rule for another wording"};
+    o.name=w;if(has)o.pfx=true;else o.bare=true}
+  return o}
+
 // ---- built-in commands (the list is the node's) ----
 const bids=()=>Object.keys(C.builtin);
 function builtins(){const l=$("b_list");l.textContent="";
   bids().forEach((id,i)=>{const b=C.builtin[id];
     l.appendChild(el("div",{className:"item"},[el("label",null,[el("input",{type:"checkbox",checked:b.enabled,id:"be_"+i}),
-      " Built-in “"+id+"”"+(BDESC[id]?" ("+BDESC[id]+")":"")+", answers to:"]),el("input",{id:"bn_"+i,value:b.name,maxLength:16})]))})}
+      " Built-in “"+id+"”"+(BDESC[id]?" ("+BDESC[id]+")":"")+", answers to:"]),el("input",{id:"bn_"+i,value:formsText(b.name,b.pfx,b.bare),maxLength:40,autocomplete:"off",spellcheck:false})]))})}
 
 // ---- custom commands ----
 function customRow(c){const d=el("div",{className:"item"});
-  d.appendChild(el("label",null,["Trigger word"]));d.appendChild(el("input",{className:"u_t",value:c.trigger||"",maxLength:16}));
+  d.appendChild(el("label",null,["Answers to (exact text, such as !hello, hello)"]));d.appendChild(el("input",{className:"u_t",value:c.trigger?formsText(c.trigger,c.pfx,c.bare):"",maxLength:40,autocomplete:"off",spellcheck:false}));
   d.appendChild(el("label",null,["Reply"]));d.appendChild(el("textarea",{className:"u_r",value:c.reply||"",maxLength:160}));
   d.appendChild(el("label",null,["Description (shown by help)"]));d.appendChild(el("input",{className:"u_d",value:c.desc||"",maxLength:48}));
   d.appendChild(el("label",null,[el("input",{type:"checkbox",className:"u_e",checked:c.enabled!==false})," Enabled"]));
@@ -430,6 +443,7 @@ function checkCustoms(list){
   const taken=bids().map(id=>(C.builtin[id].name||id).toLowerCase()),seen={};
   if(list.length>16)return"At most 16 custom commands ("+list.length+" now)";
   for(let i=0;i<list.length;i++){const c=list[i],row="Command "+(i+1)+(c.trigger?" ("+c.trigger+")":"")+": ";
+    if(c.error)return row+c.error;
     if(!/^[a-z0-9]{1,16}$/.test(c.trigger))return row+"the trigger must be 1 to 16 letters or digits, nothing else";
     const b=taken.indexOf(c.trigger);if(b>=0)return row+"the trigger is the name of a built-in command ("+taken[b]+")";
     if(seen[c.trigger])return row+"the same trigger as command "+seen[c.trigger];seen[c.trigger]=i+1;
@@ -566,17 +580,19 @@ $("c_save").onclick=()=>{const b={};FIELDS.forEach(f=>b[f]=$("c_"+f).value);
   submit("/api/config",b,"c_msg",()=>load(true))};
 $("adv_local").onclick=()=>submit("/api/advert",{flood:false},"c_msg");
 $("adv_wide").onclick=()=>submit("/api/advert",{flood:true},"c_msg");
-$("b_save").onclick=()=>{const b={},seen={};let bad=null;bids().forEach((id,i)=>{const n=$("bn_"+i).value.trim().toLowerCase();b[id]={name:n,enabled:$("be_"+i).checked};
-    if(bad)return;if(!/^[a-z0-9]{1,16}$/.test(n))bad="Built-in "+id+": the name must be 1 to 16 letters or digits";
+$("b_save").onclick=()=>{const b={},seen={};let bad=null;bids().forEach((id,i)=>{const f=formsParse($("bn_"+i).value),n=f.name;b[id]={name:n,enabled:$("be_"+i).checked,pfx:f.pfx,bare:f.bare};
+    if(bad)return;if(f.error)bad="Built-in "+id+": "+f.error;
     else if(seen[n])bad="Built-in "+id+": the same name as built-in "+seen[n];else seen[n]=id});
   if(bad){say("b_msg",bad+". Nothing was saved.",false);return}
   submit("/api/config",{builtin:b},"b_msg",()=>load(true))};
 $("u_add").onclick=()=>{$("u_list").appendChild(customRow({}));customsEmpty()};
 $("u_save").onclick=()=>{const list=[];document.querySelectorAll("#u_list .item").forEach(d=>{const look=d.querySelector(".u_l").checked;
-  list.push({trigger:d.querySelector(".u_t").value.trim().toLowerCase(),reply:oneLine(d.querySelector(".u_r").value),desc:oneLine(d.querySelector(".u_d").value),
+  const f=formsParse(d.querySelector(".u_t").value);
+  list.push({trigger:f.name||"",pfx:f.pfx===true,bare:f.bare===true,error:f.error,reply:oneLine(d.querySelector(".u_r").value),desc:oneLine(d.querySelector(".u_d").value),
     enabled:d.querySelector(".u_e").checked,url:look?d.querySelector(".u_url").value.trim():"",path:look?d.querySelector(".u_path").value.trim():"",
     cache_s:look?num(d.querySelector(".u_cache").value):0})});
   const bad=checkCustoms(list);if(bad){say("u_msg",bad+". Nothing was saved.",false);return}
+  list.forEach(c=>delete c.error);
   submit("/api/config",{custom:list},"u_msg",()=>load(true))};
 $("x_add").onclick=()=>{if(document.querySelectorAll("#x_list .item").length>=8)return;$("x_list").appendChild(matchRow({}));matchesEmpty()};
 $("x_save").onclick=()=>{const list=[];document.querySelectorAll("#x_list .item").forEach(d=>{const k=d.querySelector(".x_k").value,t=d.querySelector(".x_t").value;

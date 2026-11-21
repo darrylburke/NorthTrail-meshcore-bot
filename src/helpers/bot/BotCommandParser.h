@@ -11,10 +11,11 @@ struct BotParsed {
   bool prefixed;     // the command prefix was written, or the bot treats the command as if it had been (a text rule's)
 };
 
-// Whether a command written without the prefix is taken: in a direct message always; in a channel
-// only when the owner allows it (bare) and the word is a command the bot can answer (known), so
-// ordinary chat is left alone and uses up nobody's cooldown.
-static inline bool botBareTaken(bool is_dm, bool bare, bool known) { return is_dm || (bare && known); }
+// Whether one of the bot's own commands is taken as it was written. With the prefix: when the
+// command answers to that form (pfx). Without it: when it answers to the bare word (bare), and
+// always in a direct message. Ordinary channel chat that starts with a command's name is so left
+// alone unless the owner listed the bare word.
+static inline bool botFormTaken(bool prefixed, bool pfx, bool bare, bool is_dm) { return prefixed ? pfx : (bare || is_dm); }
 
 static inline bool botIsAlnum(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');

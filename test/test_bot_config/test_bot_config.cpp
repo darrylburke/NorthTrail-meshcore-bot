@@ -6,7 +6,7 @@
 
 static BotConfig load(const char* json){ BotConfig c; botConfigDefaults(c); JsonDocument d; deserializeJson(d,json); botConfigFromJson(d.as<JsonVariantConst>(),c); return c; }
 TEST(Cfg, Defaults)            { BotConfig c; botConfigDefaults(c); EXPECT_EQ(c.num_channels,1); EXPECT_STREQ(c.channels[0],"#bot"); EXPECT_STREQ(c.channels[1],""); EXPECT_STREQ(c.scope,""); EXPECT_EQ(c.prefix,'!'); EXPECT_EQ(c.cooldown_s,10); EXPECT_EQ(c.max_per_min,6); EXPECT_EQ(c.advert_zero_hop_min,240); EXPECT_EQ(c.advert_flood_min,1440); EXPECT_STREQ(c.builtin[BB_8BALL].name,"8ball"); EXPECT_TRUE(c.builtin[BB_PING].enabled); EXPECT_STREQ(c.web_hash,""); }
-TEST(Cfg, RoundTrip)           { BotConfig a; botConfigDefaults(a); strcpy(a.scope,"test-region"); a.lat=43.6534; a.num_custom=1; strcpy(a.custom[0].trigger,"hello"); strcpy(a.custom[0].reply,"Hi {sender}"); a.custom[0].enabled=true; JsonDocument d; botConfigToJson(a,d.to<JsonObject>(),true); BotConfig b; botConfigDefaults(b); botConfigFromJson(d.as<JsonVariantConst>(),b); EXPECT_STREQ(b.scope,"test-region"); EXPECT_DOUBLE_EQ(b.lat,43.6534); EXPECT_EQ(b.num_custom,1); EXPECT_STREQ(b.custom[0].reply,"Hi {sender}"); }
+TEST(Cfg, RoundTrip)           { BotConfig a; botConfigDefaults(a); strcpy(a.scope,"test-region"); a.lat=43.6534; a.num_custom=1; strcpy(a.custom[0].trigger,"hello"); a.custom[0].pfx=true; strcpy(a.custom[0].reply,"Hi {sender}"); a.custom[0].enabled=true; JsonDocument d; botConfigToJson(a,d.to<JsonObject>(),true); BotConfig b; botConfigDefaults(b); botConfigFromJson(d.as<JsonVariantConst>(),b); EXPECT_STREQ(b.scope,"test-region"); EXPECT_DOUBLE_EQ(b.lat,43.6534); EXPECT_EQ(b.num_custom,1); EXPECT_STREQ(b.custom[0].reply,"Hi {sender}"); }
 TEST(Cfg, SecretsOmittedForWeb){ BotConfig a; botConfigDefaults(a); strcpy(a.web_hash,"abcd"); strcpy(a.web_salt,"ef"); JsonDocument d; botConfigToJson(a,d.to<JsonObject>(),false); std::string s; serializeJson(d,s); EXPECT_EQ(s.find("abcd"),std::string::npos); EXPECT_EQ(s.find("web_"),std::string::npos); }
 TEST(Cfg, GarbageKeepsDefaults){ for(const char* j : {"", "{", "[]", "null", "{\"cooldown_s\":\"soon\",\"max_per_min\":0,\"lat\":999,\"prefix\":\"ab\",\"channel\":\"bot\"}"}) { BotConfig c=load(j); EXPECT_EQ(c.cooldown_s,10); EXPECT_EQ(c.max_per_min,6); EXPECT_DOUBLE_EQ(c.lat,0.0); EXPECT_EQ(c.prefix,'!'); EXPECT_EQ(c.num_channels,1); EXPECT_STREQ(c.channels[0],"#bot"); } }
 TEST(Cfg, OverlongRejected)    { std::string j="{\"scope\":\""+std::string(200,'x')+"\"}"; BotConfig c=load(j.c_str()); EXPECT_STREQ(c.scope,""); }
@@ -168,7 +168,7 @@ TEST(Cfg, FullRoundTripMemcmp){
   a->num_channels=1; strcpy(a->channels[0],"#mesh-test"); strcpy(a->scope,"test-region"); a->prefix='?'; a->cooldown_s=3600; a->max_per_min=30; strcpy(a->ignore,"bot,relay,rpt"); a->lat=45.4236; a->lon=-75.7009; strcpy(a->tz,"CET-1CEST,M3.5.0,M10.5.0/3"); strcpy(a->help_link,"https://example.org/bot"); a->advert_zero_hop_min=0; a->advert_flood_min=10080;
   strcpy(a->builtin[BB_PING].name,"test"); strcpy(a->builtin[BB_TEST].name,"ping"); a->builtin[BB_SUN].enabled=false; strcpy(a->builtin[BB_ROLL].name,"dice"); a->builtin[BB_8BALL].enabled=false;
   a->num_custom=16;
-  for(int i=0;i<16;i++){ snprintf(a->custom[i].trigger,17,"cmd%d",i); snprintf(a->custom[i].reply,161,"R%d \xC3\xA9\xF0\x9F\xA7\xAD {sender} \xE2\x80\xA6 %s",i,std::string(100,'z').c_str()); snprintf(a->custom[i].desc,49,"d\xC3\xA9%d",i); a->custom[i].enabled=(i%3!=0); }
+  for(int i=0;i<16;i++){ snprintf(a->custom[i].trigger,17,"cmd%d",i); snprintf(a->custom[i].reply,161,"R%d \xC3\xA9\xF0\x9F\xA7\xAD {sender} \xE2\x80\xA6 %s",i,std::string(100,'z').c_str()); snprintf(a->custom[i].desc,49,"d\xC3\xA9%d",i); a->custom[i].enabled=(i%3!=0); a->custom[i].pfx=(i%2==0); a->custom[i].bare=(i%2==1)||(i%4==0); }
   strcpy(a->web_salt,HEX16); strcpy(a->web_hash,HEX64);
   JsonDocument d; botConfigToJson(*a,d.to<JsonObject>(),true);
   BotConfig* b=heapDefaults(); botConfigFromJson(d.as<JsonVariantConst>(),*b);
@@ -459,7 +459,7 @@ TEST(M2, StrictStillNeverTouchesSecrets){
 TEST(M2, FullRoundTripWithLookupsAndWatch){
   BotConfig* a=heapDefaults();
   a->num_custom=16;
-  for(int i=0;i<16;i++){ snprintf(a->custom[i].trigger,17,"cmd%d",i); snprintf(a->custom[i].reply,161,(i%4!=3)?"R%d {fetch}":"R%d plain",i); snprintf(a->custom[i].desc,49,"d%d",i); a->custom[i].enabled=(i%2==0);
+  for(int i=0;i<16;i++){ snprintf(a->custom[i].trigger,17,"cmd%d",i); snprintf(a->custom[i].reply,161,(i%4!=3)?"R%d {fetch}":"R%d plain",i); snprintf(a->custom[i].desc,49,"d%d",i); a->custom[i].enabled=(i%2==0); a->custom[i].pfx=true; a->custom[i].bare=(i%3==0);
     if(i%4!=3){ snprintf(a->custom[i].url,161,"https://example.org/v%d?q={args}",i); snprintf(a->custom[i].path,49,"data[%d].v",i); a->custom[i].cache_s=(uint16_t)(i*200); } }
   
   a->num_watch=4; a->watch_online_min=1440;
@@ -474,7 +474,7 @@ TEST(M2, FullRoundTripWithLookupsAndWatch){
   delete a; delete b; delete e;
 }
 TEST(M2, ToJsonAlwaysWritesNewMembers){
-  BotConfig* a=heapDefaults(); a->num_custom=1; strcpy(a->custom[0].trigger,"t"); strcpy(a->custom[0].reply,"r");
+  BotConfig* a=heapDefaults(); a->num_custom=1; strcpy(a->custom[0].trigger,"t"); a->custom[0].pfx=true; strcpy(a->custom[0].reply,"r");
   JsonDocument d; botConfigToJson(*a,d.to<JsonObject>(),false);
   EXPECT_TRUE(d["custom"][0]["url"].is<const char*>()); EXPECT_TRUE(d["custom"][0]["path"].is<const char*>()); EXPECT_EQ(d["custom"][0]["cache_s"].as<int>(),0);
   EXPECT_TRUE(d["watch"].is<JsonArray>()); EXPECT_EQ(d["watch"].as<JsonArray>().size(),0u); EXPECT_EQ(d["watch_online_min"].as<int>(),720);
@@ -973,6 +973,32 @@ TEST(CfgMatch, RulesLoadRoundTripAndRefuse) {
   EXPECT_EQ(c->num_match, 2); EXPECT_STREQ(rep.match, "#9: at most 8 text rules");
   deserializeJson(p, "{\"match\":[]}"); botConfigFromWebJsonStrict(p.as<JsonVariantConst>(), *c, rep);
   EXPECT_EQ(c->num_match, 0); EXPECT_STREQ(rep.match, "");
+  delete c; delete r;
+}
+
+TEST(CfgForms, EachCommandSaysWhichFormsItAnswersTo) {
+  BotConfig* c = heapDefaults();
+  EXPECT_TRUE(c->builtin[BB_PING].pfx); EXPECT_FALSE(c->builtin[BB_PING].bare);
+  applyTo(*c, "{\"builtin\":{\"ping\":{\"bare\":true},\"test\":{\"pfx\":false,\"bare\":true},\"path\":{\"pfx\":false},\"help\":{\"pfx\":false,\"bare\":false}},"
+              "\"custom\":[{\"trigger\":\"a\",\"reply\":\"x\"},{\"trigger\":\"b\",\"reply\":\"x\",\"pfx\":false,\"bare\":true},"
+              "{\"trigger\":\"c\",\"reply\":\"x\",\"pfx\":false},{\"trigger\":\"d\",\"reply\":\"x\",\"bare\":\"yes\"}]}");
+  EXPECT_TRUE(c->builtin[BB_PING].pfx);  EXPECT_TRUE(c->builtin[BB_PING].bare);
+  EXPECT_FALSE(c->builtin[BB_TEST].pfx); EXPECT_TRUE(c->builtin[BB_TEST].bare);
+  EXPECT_TRUE(c->builtin[BB_PATH].pfx);  EXPECT_FALSE(c->builtin[BB_PATH].bare);   // neither form: not taken
+  EXPECT_TRUE(c->builtin[BB_HELP].pfx);
+  ASSERT_EQ(c->num_custom, 2);   // "c" (neither form) and "d" (not a boolean) are skipped
+  EXPECT_TRUE(c->custom[0].pfx); EXPECT_FALSE(c->custom[0].bare);
+  EXPECT_FALSE(c->custom[1].pfx); EXPECT_TRUE(c->custom[1].bare);
+  JsonDocument d; ASSERT_TRUE(botConfigToJsonChecked(*c, d, true));
+  BotConfig* r = heapDefaults(); botConfigFromJson(d.as<JsonVariantConst>(), *r);
+  EXPECT_EQ(memcmp(c, r, sizeof *c), 0);
+  BotApplyReport rep; JsonDocument p;
+  deserializeJson(p, "{\"builtin\":{\"ping\":{\"pfx\":false,\"bare\":false}}}");
+  botConfigFromWebJsonStrict(p.as<JsonVariantConst>(), *c, rep);
+  EXPECT_TRUE(c->builtin[BB_PING].pfx); EXPECT_NE(rep.builtin[0], '\0');
+  deserializeJson(p, "{\"custom\":[{\"trigger\":\"a\",\"reply\":\"x\",\"pfx\":false}]}");
+  botConfigFromWebJsonStrict(p.as<JsonVariantConst>(), *c, rep);
+  EXPECT_EQ(c->num_custom, 2); EXPECT_NE(rep.custom[0], '\0');
   delete c; delete r;
 }
 

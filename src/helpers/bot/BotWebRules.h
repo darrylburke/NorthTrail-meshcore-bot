@@ -444,7 +444,8 @@ static inline int botGuard(const BotReqFacts& f) {
 //  - the punctuation and keys of each object are the literal text below with the values
 //    removed (sizeof - 1), plus one comma per array element / object member.
 // With BotConfig as it stands (4 channels, 16 custom commands, 8 text rules, 4 watch entries,
-// 14 built-ins) this comes to 18,974 bytes, of which the bare switch and the text rules are 1,976
+// 14 built-ins) this comes to 19,724 bytes (each built-in and custom command also says which forms it answers
+// to, "pfx" and "bare", 25 bytes a command), of which the bare switch and the text rules are 1,976
 // (keys 19, the switch 5, per rule 244 = text 98, run 98, kind 7, enabled 5, keys and comma 36).
 // Without those: per channel 65 (the name 64, comma 1), per custom command 887
 // (trigger 18, reply 322, desc 98, url 322, path 50, two small values 10, keys and comma 67), per
@@ -459,13 +460,13 @@ static inline int botGuard(const BotReqFacts& f) {
 #define BOT_JN_U8 3
 #define BOT_JN_BOOL 5
 static const size_t BOT_CFG_JSON_BUILTIN_MAX =   // "<id>":{"name":"..","enabled":false},
-    BOT_JS_PLAIN(BOT_FSZ(BotBuiltinCfg, name)) + (sizeof(":{\"name\":,\"enabled\":}") - 1) +
-    BOT_JS_PLAIN(BOT_FSZ(BotBuiltinCfg, name)) + BOT_JN_BOOL + 1;
+    BOT_JS_PLAIN(BOT_FSZ(BotBuiltinCfg, name)) + (sizeof(":{\"name\":,\"enabled\":,\"pfx\":,\"bare\":}") - 1) +
+    BOT_JS_PLAIN(BOT_FSZ(BotBuiltinCfg, name)) + 3 * BOT_JN_BOOL + 1;
 static const size_t BOT_CFG_JSON_CUSTOM_MAX =
-    (sizeof("{\"trigger\":,\"reply\":,\"desc\":,\"enabled\":,\"url\":,\"path\":,\"cache_s\":}") - 1) +
+    (sizeof("{\"trigger\":,\"reply\":,\"desc\":,\"enabled\":,\"url\":,\"path\":,\"cache_s\":,\"pfx\":,\"bare\":}") - 1) +
     BOT_JS_PLAIN(BOT_FSZ(BotCustomCmd, trigger)) + BOT_JS_ESC(BOT_FSZ(BotCustomCmd, reply)) +
     BOT_JS_ESC(BOT_FSZ(BotCustomCmd, desc)) + BOT_JN_BOOL + BOT_JS_ESC(BOT_FSZ(BotCustomCmd, url)) +
-    BOT_JS_PLAIN(BOT_FSZ(BotCustomCmd, path)) + BOT_JN_U16 + 1;
+    BOT_JS_PLAIN(BOT_FSZ(BotCustomCmd, path)) + BOT_JN_U16 + 2 * BOT_JN_BOOL + 1;
 static const size_t BOT_CFG_JSON_WATCH_MAX =
     (sizeof("{\"label\":,\"kind\":,\"id\":}") - 1) + BOT_JS_ESC(BOT_FSZ(BotWatchCfg, label)) +
     (sizeof("\"observer\"") - 1) + BOT_JS_PLAIN(BOT_FSZ(BotWatchCfg, id)) + 1;

@@ -502,13 +502,13 @@ static void makeWorstConfig(BotConfig& c) {
   fillQuotes(c.tz, "", "1");                     // anything with a digit is taken as a POSIX string
   fillQuotes(c.help_link);
   c.advert_zero_hop_min = 65535; c.advert_flood_min = 65535;
-  for (int i = 0; i < BB_COUNT; i++) { fillChar(c.builtin[i].name, 'a' + i); c.builtin[i].enabled = false; }
+  for (int i = 0; i < BB_COUNT; i++) { fillChar(c.builtin[i].name, 'a' + i); c.builtin[i].enabled = false; c.builtin[i].pfx = false; c.builtin[i].bare = false; }
   c.num_custom = BOT_MAX_CUSTOM;
   for (int i = 0; i < BOT_MAX_CUSTOM; i++) {
     BotCustomCmd& u = c.custom[i];
     fillChar(u.trigger, 'q'); u.trigger[0] = (char)('a' + i);
     fillQuotes(u.reply); fillQuotes(u.desc);
-    u.enabled = false;
+    u.enabled = false; u.pfx = false; u.bare = false;
     fillQuotes(u.url, "http://a?");
     fillChar(u.path, 'k');
     u.cache_s = 65535;

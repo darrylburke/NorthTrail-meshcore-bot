@@ -21,10 +21,12 @@
 // is reported.
 
 enum BotBuiltin : uint8_t { BB_PING, BB_TEST, BB_PATH, BB_HELP, BB_HEARD, BB_MESH, BB_DIST, BB_SUN, BB_ROLL, BB_8BALL, BB_WX, BB_AURORA, BB_ALERTS, BB_NODES, BB_COUNT };
-struct BotBuiltinCfg { char name[17]; bool enabled; };
+// A command answers to its name written with the prefix (pfx), without it (bare), or both; never
+// neither. In a direct message either form is always taken.
+struct BotBuiltinCfg { char name[17]; bool enabled; bool pfx; bool bare; };
 // A custom command may carry a live lookup: when url is set, the reply's {fetch} is the value at
 // path in the JSON the url returns (kept for cache_s seconds). url/path are both set or both empty.
-struct BotCustomCmd  { char trigger[17]; char reply[161]; char desc[49]; bool enabled; char url[161]; char path[49]; uint16_t cache_s; };
+struct BotCustomCmd  { char trigger[17]; char reply[161]; char desc[49]; bool enabled; char url[161]; char path[49]; uint16_t cache_s; bool pfx; bool bare; };
 #define BOT_MAX_CUSTOM 16
 // A watched observer (kind BW_OBSERVER, id a lower-case UUID) or node (BW_NODE, id 64 upper-case hex).
 enum BotWatchKind : uint8_t { BW_OBSERVER = 0, BW_NODE = 1 };
@@ -47,7 +49,7 @@ struct BotConfig {
   BotBuiltinCfg builtin[BB_COUNT];   // default names: ping test path help heard mesh dist sun roll 8ball wx aurora alerts nodes, all enabled
   BotCustomCmd  custom[BOT_MAX_CUSTOM];
   uint8_t num_custom;
-  bool bare;               // false: a channel command needs the prefix. true: a known command also answers without it
+  bool bare;               // true: a command a program on the broker announced also answers without the prefix
   BotMatchRule match[BOT_MAX_MATCH];   // text rules, tried in order before the message is read as a command
   uint8_t num_match;
   BotWatchCfg watch[BOT_MAX_WATCH];
@@ -87,7 +89,7 @@ static inline void botConfigDefaults(BotConfig& c) {
   c.watch_online_min = 720;
   c.mqtt_port = 1883;
   c.mqtt_wait_s = 5;
-  for (int i = 0; i < BB_COUNT; i++) { strcpy(c.builtin[i].name, botBuiltinId(i)); c.builtin[i].enabled = true; }
+  for (int i = 0; i < BB_COUNT; i++) { strcpy(c.builtin[i].name, botBuiltinId(i)); c.builtin[i].enabled = true; c.builtin[i].pfx = true; }
 }
 
 // Time zone name -> POSIX TZ string. Null/empty -> nullptr; table lookups are case-sensitive
@@ -321,6 +323,14 @@ static inline const char* botUrlErrText(BotUrlErr e) {
   }
 }
 
+// The two forms a posted command asks for: pfx defaults to true and bare to false when absent.
+// False when the result would be neither.
+static inline bool botCfgFormsOk(JsonVariantConst e) {
+  bool pfx = e["pfx"].is<bool>() ? e["pfx"].as<bool>() : true;
+  bool bare = e["bare"].is<bool>() ? e["bare"].as<bool>() : false;
+  return pfx || bare;
+}
+
 // One posted custom command: nullptr when valid (its lower-cased trigger in trig), else why not.
 // Also the rule set the lenient file loader uses, so the two paths cannot drift apart.
 static inline const char* botCustomElemError(JsonVariantConst e, char trig[17]) {
@@ -334,6 +344,9 @@ static inline const char* botCustomElemError(JsonVariantConst e, char trig[17]) 
   if (!e["desc"].isNull() && !botCfgGetStr(e["desc"], sizeof(((BotCustomCmd*)0)->desc), true, s, n))
     return "description must be at most 48 bytes, without line breaks or tabs";
   if (!e["enabled"].isNull() && !e["enabled"].is<bool>()) return "enabled must be true or false";
+  if ((!e["pfx"].isNull() && !e["pfx"].is<bool>()) || (!e["bare"].isNull() && !e["bare"].is<bool>()))
+    return "pfx and bare must be true or false";
+  if (!botCfgFormsOk(e)) return "must answer with the prefix, without it, or both";
   bool url_set = false, path_set = false;
   if (!e["url"].isNull()) {
     if (!botCfgGetStr(e["url"], sizeof(((BotCustomCmd*)0)->url), true, s, n)) return "url: must be at most 160 bytes of text";
@@ -618,6 +631,14 @@ static inline void botConfigApply(JsonVariantConst src, BotConfig& c, bool with_
       if (!e.is<JsonObjectConst>()) continue;
       JsonVariantConst en = e["enabled"];
       if (en.is<bool>()) c.builtin[i].enabled = en.as<bool>();
+      // The forms: each given one is taken, unless that would leave the command with neither.
+      {
+        bool pfx = e["pfx"].is<bool>() ? e["pfx"].as<bool>() : c.builtin[i].pfx;
+        bool bare = e["bare"].is<bool>() ? e["bare"].as<bool>() : c.builtin[i].bare;
+        if (pfx || bare) { c.builtin[i].pfx = pfx; c.builtin[i].bare = bare; }
+        else if (rep && !rep->builtin[0])
+          snprintf(rep->builtin, sizeof(rep->builtin), "built-in '%s': must answer with the prefix, without it, or both", botBuiltinId(i));
+      }
       char nm[17];
       if (botCfgGetName(e["name"], nm)) {
         if (strcmp(nm, c.builtin[i].name) != 0) { memcpy(want[i], nm, 17); want_changed[i] = true; }
@@ -658,6 +679,8 @@ static inline void botConfigApply(JsonVariantConst src, BotConfig& c, bool with_
         botCfgSetStr(e["reply"], cc.reply, sizeof(cc.reply), false);
         if (!e["desc"].isNull()) botCfgSetStr(e["desc"], cc.desc, sizeof(cc.desc), true);
         cc.enabled = e["enabled"].isNull() ? true : e["enabled"].as<bool>();
+        cc.pfx = e["pfx"].is<bool>() ? e["pfx"].as<bool>() : true;
+        cc.bare = e["bare"].is<bool>() ? e["bare"].as<bool>() : false;
         if (!e["url"].isNull()) botCfgSetStr(e["url"], cc.url, sizeof(cc.url), true);
         if (!e["path"].isNull()) botCfgSetStr(e["path"], cc.path, sizeof(cc.path), true);
         long long cv;
@@ -767,6 +790,8 @@ static inline void botConfigToJson(const BotConfig& c, JsonObject dst, bool for_
     JsonObject e = b[botBuiltinId(i)].to<JsonObject>();
     e["name"] = (const char*)c.builtin[i].name;
     e["enabled"] = c.builtin[i].enabled;
+    e["pfx"] = c.builtin[i].pfx;
+    e["bare"] = c.builtin[i].bare;
   }
   JsonArray arr = dst["custom"].to<JsonArray>();
   for (int i = 0; i < c.num_custom && i < BOT_MAX_CUSTOM; i++) {
@@ -778,6 +803,8 @@ static inline void botConfigToJson(const BotConfig& c, JsonObject dst, bool for_
     e["url"] = (const char*)c.custom[i].url;
     e["path"] = (const char*)c.custom[i].path;
     e["cache_s"] = c.custom[i].cache_s;
+    e["pfx"] = c.custom[i].pfx;
+    e["bare"] = c.custom[i].bare;
   }
   dst["bare"] = c.bare;
   JsonArray ma = dst["match"].to<JsonArray>();
@@ -874,7 +901,8 @@ static inline bool botCfgKeySame(const char* k, const BotConfig& a, const BotCon
   if (strcmp(k, "mqtt_wait_s") == 0) return a.mqtt_wait_s == b.mqtt_wait_s;
   if (strcmp(k, "builtin") == 0) {
     for (int i = 0; i < BB_COUNT; i++)
-      if (strcmp(a.builtin[i].name, b.builtin[i].name) != 0 || a.builtin[i].enabled != b.builtin[i].enabled) return false;
+      if (strcmp(a.builtin[i].name, b.builtin[i].name) != 0 || a.builtin[i].enabled != b.builtin[i].enabled ||
+          a.builtin[i].pfx != b.builtin[i].pfx || a.builtin[i].bare != b.builtin[i].bare) return false;
     return true;
   }
   if (strcmp(k, "custom") == 0) {
@@ -884,7 +912,8 @@ static inline bool botCfgKeySame(const char* k, const BotConfig& a, const BotCon
     for (int i = 0; i < na; i++) {
       const BotCustomCmd &x = a.custom[i], &y = b.custom[i];
       if (strcmp(x.trigger, y.trigger) != 0 || strcmp(x.reply, y.reply) != 0 || strcmp(x.desc, y.desc) != 0 ||
-          x.enabled != y.enabled || strcmp(x.url, y.url) != 0 || strcmp(x.path, y.path) != 0 || x.cache_s != y.cache_s)
+          x.enabled != y.enabled || strcmp(x.url, y.url) != 0 || strcmp(x.path, y.path) != 0 || x.cache_s != y.cache_s ||
+          x.pfx != y.pfx || x.bare != y.bare)
         return false;
     }
     return true;
@@ -958,8 +987,9 @@ static inline bool botCfgPostedSame(const char* k, JsonVariantConst v, const Bot
     if (o.size() != (size_t)BB_COUNT) return false;
     for (int i = 0; i < BB_COUNT; i++) {
       JsonVariantConst e = o[botBuiltinId(i)];
-      if (!e.is<JsonObjectConst>() || e.size() != 2) return false;
-      if (!(e["name"] == (const char*)c.builtin[i].name) || !(e["enabled"] == c.builtin[i].enabled)) return false;
+      if (!e.is<JsonObjectConst>() || e.size() != 4) return false;
+      if (!(e["name"] == (const char*)c.builtin[i].name) || !(e["enabled"] == c.builtin[i].enabled) ||
+          !(e["pfx"] == c.builtin[i].pfx) || !(e["bare"] == c.builtin[i].bare)) return false;
     }
     return true;
   }
@@ -971,7 +1001,7 @@ static inline bool botCfgPostedSame(const char* k, JsonVariantConst v, const Bot
     int i = 0;
     for (JsonVariantConst e : arr) {
       const BotCustomCmd& x = c.custom[i++];
-      if (!e.is<JsonObjectConst>() || e.size() != 7) return false;
+      if (!e.is<JsonObjectConst>() || e.size() != 9 || !(e["pfx"] == x.pfx) || !(e["bare"] == x.bare)) return false;
       if (!(e["trigger"] == (const char*)x.trigger) || !(e["reply"] == (const char*)x.reply) ||
           !(e["desc"] == (const char*)x.desc) || !(e["enabled"] == x.enabled) || !(e["url"] == (const char*)x.url) ||
           !(e["path"] == (const char*)x.path) || !(e["cache_s"] == x.cache_s))

@@ -353,25 +353,29 @@ void BotTask::handle(mesh::Packet* pkt, const char* raw_sender, const char* body
 
 // What a message asks for, if anything. A text rule is tried first: the message then stands for
 // the command line the owner gave it, exactly as if that had been sent with the prefix (so it may
-// also go to the broker). Otherwise the message is read as a command; without the prefix it
-// counts in a direct message, and in a channel only by botBareTaken. A bare word that a program on
-// the broker has announced is offered to the broker when bare commands are allowed.
+// also go to the broker). Otherwise the message is read as a command. One of the bot's own is
+// taken only in a form the owner listed for it (botFormTaken). Any other word goes on when it
+// was written with the prefix (the broker may know it), or without it when a program on the
+// broker has announced it and the owner allows those bare, or in a direct message (as before).
 bool BotTask::resolve(const char* body, bool is_dm, BotParsed& p) {
   if (botMatchFind(_cfg.match, _cfg.num_match, body, _line, sizeof(_line)) >= 0) {
     if (!botParse(_line, _cfg.prefix, true, p)) return false;
     p.prefixed = true;
     return true;
   }
-  if (!botParse(body, _cfg.prefix, is_dm || _cfg.bare, p)) return false;
+  if (!botParse(body, _cfg.prefix, true, p)) return false;
+  for (int i = 0; i < BB_COUNT; i++)
+    if (_cfg.builtin[i].enabled && strcmp(_cfg.builtin[i].name, p.cmd) == 0)
+      return botFormTaken(p.prefixed, _cfg.builtin[i].pfx, _cfg.builtin[i].bare, is_dm);
+  for (int i = 0; i < _cfg.num_custom && i < BOT_MAX_CUSTOM; i++)
+    if (_cfg.custom[i].enabled && strcmp(_cfg.custom[i].trigger, p.cmd) == 0)
+      return botFormTaken(p.prefixed, _cfg.custom[i].pfx, _cfg.custom[i].bare, is_dm);
   if (p.prefixed) return true;
-  bool own = false;
-  for (int i = 0; i < BB_COUNT && !own; i++) own = _cfg.builtin[i].enabled && strcmp(_cfg.builtin[i].name, p.cmd) == 0;
-  for (int i = 0; i < _cfg.num_custom && i < BOT_MAX_CUSTOM && !own; i++)
-    own = _cfg.custom[i].enabled && strcmp(_cfg.custom[i].trigger, p.cmd) == 0;
-  bool announced = !own && _mqtt.ready() && _mqtt.commands().find(p.cmd) != nullptr;
-  if (!botBareTaken(is_dm, _cfg.bare, own || announced)) return false;
-  if (_cfg.bare && announced) p.prefixed = true;
-  return true;
+  if (_cfg.bare && _mqtt.ready() && _mqtt.commands().find(p.cmd) != nullptr) {
+    p.prefixed = true;
+    return true;
+  }
+  return is_dm;
 }
 
 bool BotTask::tryCommand(const char* text, uint32_t id) {

@@ -103,13 +103,15 @@ There is no default password.
 
 ## Using the bot
 
-- **On a channel**, a command needs the prefix (default `!`): `!ping`. With the setting
-  "also answer commands written without the prefix" switched on, `ping` works too. Only a
-  message that starts with the name of a command the bot can answer is taken, so other chat is
-  left alone, but a chat line that happens to start with a command name is answered.
-- **In a direct message**, the prefix is optional for built-in and custom commands: `ping`.
-  A command answered over MQTT needs the prefix unless that same setting is on and a program has
-  announced the name, so ordinary chat sent to the bot is never forwarded to an outside program.
+- **Each command answers to exact text you choose:** its name with the prefix (`!ping`), without
+  it (`ping`), or both. On the web page the box beside each built-in and custom command shows
+  that text, for example `!ping, ping`. The default is the prefixed form only.
+- **On a channel**, a command is answered only in a form listed for it. Listing the bare word
+  means a chat line that happens to start with it is answered too.
+- **In a direct message**, the bot's own commands are answered in either form.
+- **A command answered over MQTT** needs the prefix, unless "also answer commands from the broker
+  written without the prefix" is on and a program has announced the name. Ordinary chat sent to
+  the bot is never forwarded to an outside program.
 - **Text rules** let the bot answer messages that are not written as commands at all. See
   [Text rules](#text-rules).
 - **Replies** go back where the command came from: the same channel, or a direct message. Every
@@ -212,8 +214,6 @@ be a built-in, a custom command or one answered over MQTT.
   too many steps or nests more than 16 deep is given up and counts as no match. Keep patterns
   simple; a repeated group such as `(\w+ )+` stops matching beyond about a dozen rounds, so
   prefer `.*` or a set such as `[a-z ]*`.
-- With commands without the prefix switched on, an announced MQTT command also works without the
-  prefix in a direct message.
 - A text or pattern is at most 48 bytes, and so is the command.
 
 ## The web page
@@ -239,7 +239,8 @@ Stored on the node in `/bot.json`.
 | Channels | `#bot` | 1 to 4, each `#name` or `Public`. One scope for all of them |
 | Scope | none | The region scope replies and adverts carry |
 | Prefix | `!` | One character |
-| Commands without the prefix | off | On: in channels, a message starting with a known command name is answered without the prefix |
+| Broker commands without the prefix | off | On: a command a program on the broker has announced is answered without the prefix |
+| Answers to (per command) | `!name` | For each built-in and custom command: with the prefix, without it, or both |
 | Text rules | none | Up to 8. See [Text rules](#text-rules) |
 | Cooldown | 10 s | 0 to 3600. Minimum time between replies to one sender |
 | Max per minute | 6 | 1 to 30. Replies to everyone, on all channels together |

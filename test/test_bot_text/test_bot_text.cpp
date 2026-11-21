@@ -90,11 +90,14 @@ TEST(BotClamp, SweepNeverSplitsOrOverruns) {
   }
 }
 
-TEST(BotParse, BareWordsInAChannelNeedTheSwitchAndAKnownCommand) {
-  EXPECT_TRUE(botBareTaken(true, false, false));    // a direct message, as before
-  EXPECT_FALSE(botBareTaken(false, false, true));   // channel, switch off
-  EXPECT_FALSE(botBareTaken(false, true, false));   // channel, ordinary chat
-  EXPECT_TRUE(botBareTaken(false, true, true));
+TEST(BotParse, ACommandIsTakenOnlyInAFormItAnswersTo) {
+  // prefixed, pfx, bare, is_dm
+  EXPECT_TRUE(botFormTaken(true, true, false, false));     // "!ping" for a command listing "!ping"
+  EXPECT_FALSE(botFormTaken(true, false, true, false));    // "!ping" for a command listing only "ping"
+  EXPECT_FALSE(botFormTaken(true, false, true, true));     // the same in a direct message
+  EXPECT_TRUE(botFormTaken(false, true, true, false));     // "ping" in a channel, listed
+  EXPECT_FALSE(botFormTaken(false, true, false, false));   // "ping" in a channel, not listed
+  EXPECT_TRUE(botFormTaken(false, true, false, true));     // a direct message never needs the prefix
 }
 
 int main(int argc, char** argv) {
