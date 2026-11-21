@@ -30,6 +30,7 @@ kept as [README-MeshCore.md](README-MeshCore.md). All of the bot is behind one b
 - [Using the bot](#using-the-bot)
 - [Built-in commands](#built-in-commands)
 - [Custom commands](#custom-commands)
+- [Text rules](#text-rules)
 - [The web page](#the-web-page)
 - [Settings](#settings)
 - [MQTT: commands answered by your own programs](#mqtt-commands-answered-by-your-own-programs)
@@ -102,10 +103,15 @@ There is no default password.
 
 ## Using the bot
 
-- **On a channel**, a command needs the prefix (default `!`): `!ping`.
+- **On a channel**, a command needs the prefix (default `!`): `!ping`. With the setting
+  "also answer commands written without the prefix" switched on, `ping` works too. Only a
+  message that starts with the name of a command the bot can answer is taken, so other chat is
+  left alone, but a chat line that happens to start with a command name is answered.
 - **In a direct message**, the prefix is optional for built-in and custom commands: `ping`.
-  Commands answered over MQTT always need the prefix, so ordinary chat sent to the bot is never
-  forwarded to an outside program.
+  A command answered over MQTT needs the prefix unless that same setting is on and a program has
+  announced the name, so ordinary chat sent to the bot is never forwarded to an outside program.
+- **Text rules** let the bot answer messages that are not written as commands at all. See
+  [Text rules](#text-rules).
 - **Replies** go back where the command came from: the same channel, or a direct message. Every
   reply starts with a mention of the asker, `@[name]`. The bot never treats a message starting
   with `@[` as a command, which keeps bots from answering each other.
@@ -113,7 +119,7 @@ There is no default password.
   that asks for several messages (up to four).
 - **Silence means no.** An unknown command, a failed look-up on a channel, a sender in cooldown or
   a full minute all produce nothing. In a direct message a failed internet command says so.
-- **Order of look-up:** built-in command, then custom command, then MQTT.
+- **Order of look-up:** text rules first; then built-in command, custom command, MQTT.
 - A direct message only arrives if the bot knows the sender, so the two nodes must have heard each
   other's adverts first.
 
@@ -121,7 +127,7 @@ There is no default password.
 
 | Command | Reply | Needs internet |
 |---|---|---|
-| `ping` | Hop count and signal of your message | no |
+| `ping` | Hop count and signal of your message, then the route it took: one repeater to a line, by name where known | no |
 | `test` | Path, SNR and RSSI of your message | no |
 | `path` | The repeaters your message came through, by name where known | no |
 | `help` | The command list and the help link; `help 2` continues; `help <command>` gives one line | no |
@@ -138,6 +144,9 @@ There is no default password.
 
 Notes:
 
+- `ping` lists each repeater as `a53e: Name`, or `a53e: ?` when the bot has no name for it.
+  Only whole lines are sent; when a long route does not fit one message the last line says how
+  many are left out (`+12 more`). A direct or zero-hop message has no list.
 - `heard` and `mesh` use counters kept in memory; they start again after a reboot.
 - `dist` needs your position. In a direct message the bot uses your contact's advertised position.
   On a channel it matches your name against its contacts, and says the position is unknown when
@@ -176,16 +185,44 @@ A slow or failed look-up sends nothing.
 Custom replies always get the asker's mention in front. A reply that already begins with
 `@[{sender}]` is not doubled.
 
+## Text rules
+
+Up to eight, edited on the web page. A rule says which message to look for and which command to
+run when it arrives, exactly as if that command had been sent with the prefix. The command can
+be a built-in, a custom command or one answered over MQTT.
+
+| Kind | Matches | Example text | Example command |
+|---|---|---|---|
+| Exact text | The whole message, ignoring capitals and spaces at the ends. It may include the prefix | `good morning` | `hello` |
+| Pattern | A regular expression found anywhere in the message. Use `^` and `$` for the start and end | `^weather (?:in )?(.+)$` | `wx {1}` |
+
+- In the command, `{0}` is the text that matched and `{1}` to `{9}` are a pattern's groups. The
+  command name itself must be written out, so a stranger's text can never choose which command
+  runs.
+- Rules are tried from the top before the message is read as a command, and the first that fits
+  wins. A message starting with `@[` (a bot's reply) never matches.
+- Patterns support `.` `^` `$` `\b` `\d` `\w` `\s`, sets such as `[a-z]` and `[^,]`, groups
+  `( )` and `(?: )`, alternatives `a|b`, and the repeats `*` `+` `?`. Capitals are ignored. Not
+  supported: `{n,m}` repeats, lazy repeats such as `*?`, look-around, back-references, and
+  letter escapes such as `\n` or `\B`. The page refuses a pattern the bot cannot run and says why.
+- A pattern is matched against text strangers send, so the work is bounded: a search that takes
+  too many steps or nests more than 16 deep is given up and counts as no match. Keep patterns
+  simple; a repeated group such as `(\w+ )+` stops matching beyond about a dozen rounds, so
+  prefer `.*` or a set such as `[a-z ]*`.
+- With commands without the prefix switched on, an announced MQTT command also works without the
+  prefix in a direct message.
+- A text or pattern is at most 48 bytes, and so is the command.
+
 ## The web page
 
 Served over plain HTTP on port 80, on your local network only.
 
 - **Status:** uptime, WiFi, clock, nodes heard, free memory, and the MQTT connection.
 - **Try a command:** runs a command as if it had arrived in a direct message and shows the reply.
-  Nothing is transmitted. To try an MQTT command, type it with the prefix; the page shows only the
-  first message of a multi-message reply, marked `[1/N]`.
-- **Settings,** the built-in commands (rename or switch off), custom commands, watched nodes and
-  MQTT.
+  Nothing is transmitted. Text rules are tried too. To try an MQTT command, type it with the
+  prefix; the page shows only the first message of a multi-message reply, marked `[1/N]`.
+- **Settings,** the built-in commands (rename or switch off), custom commands, text rules,
+  watched nodes and MQTT.
 - **Advertise now,** and a change-password form.
 - **Recent:** the last commands and replies, kept in memory only.
 - **Node:** name, channels and default scope, read-only (set these in the MeshCore app).
@@ -199,6 +236,8 @@ Stored on the node in `/bot.json`.
 | Channels | `#bot` | 1 to 4, each `#name` or `Public`. One scope for all of them |
 | Scope | none | The region scope replies and adverts carry |
 | Prefix | `!` | One character |
+| Commands without the prefix | off | On: in channels, a message starting with a known command name is answered without the prefix |
+| Text rules | none | Up to 8. See [Text rules](#text-rules) |
 | Cooldown | 10 s | 0 to 3600. Minimum time between replies to one sender |
 | Max per minute | 6 | 1 to 30. Replies to everyone, on all channels together |
 | Ignore | `bot` | Sender names containing any of these are ignored, as is the bot's own name |

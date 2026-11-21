@@ -102,6 +102,7 @@ public:
 private:
   void handle(mesh::Packet* pkt, const char* sender, const char* body, const ContactInfo* dm_from, const char* channel);
   // The command path shared by channel messages, direct messages and web tries.
+  bool resolve(const char* body, bool is_dm, BotParsed& p);
   void process(const BotParsed& p, const BotMsgInfo& m, const BotReplyDest& dest, const char* sender,
                const char* body, const ContactInfo* dm_from, const char* channel, uint32_t now_ms);
   // The one place a reply body leaves: adds the mention (source BRT_FOREIGN, for text from a custom
@@ -183,6 +184,7 @@ private:
   char _reply[128];   // the on-air text
   char _tmp[208];     // also a broker reply's text (up to 200 bytes)
   char _args[160];
+  char _line[128];    // the command line a text rule stands for
   char _path_hex[96];
   char _var_time[16], _var_date[24], _var_uptime[24];   // {time} {date} {uptime}
 

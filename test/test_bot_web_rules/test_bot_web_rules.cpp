@@ -519,6 +519,14 @@ static void makeWorstConfig(BotConfig& c) {
     c.watch[i].kind = BW_OBSERVER;
     fillChar(c.watch[i].id, 'F');
   }
+  c.bare = false;
+  c.num_match = BOT_MAX_MATCH;
+  for (int i = 0; i < BOT_MAX_MATCH; i++) {
+    c.match[i].kind = BMK_REGEX;                 // "regex" is as long as "exact"
+    c.match[i].enabled = false;
+    fillQuotes(c.match[i].text);
+    fillQuotes(c.match[i].run);
+  }
   c.watch_online_min = 65535;
   c.mqtt_enabled = false;                        // "false" is the longest boolean; mqtt_pass_set is false too
   fillChar(c.mqtt_host, 'h');
@@ -541,13 +549,13 @@ TEST(StateSize, WorstSettingsFitTheBound) {
   //  - the two coordinates are shorter than the 24 bytes counted for a double;
   //  - some bytes cannot be '"' and so are not escaped (each url's "http://a?", the '#' of each
   //    channel, the digit of the time zone), though the bound counts every byte as escaped;
-  //  - the last element of each of the four lists (channels, custom, watch, and the built-in
-  //    members) has no comma after it, though the bound counts one per element;
+  //  - the last element of each of the five lists (channels, custom, text rules, watch, and the
+  //    built-in members) has no comma after it, though the bound counts one per element;
   //  - mqtt_wait_s is at most 15, two digits, where the bound counts three (any uint8_t).
   size_t slack = 0;
   for (int i = 0; i < BB_COUNT; i++) slack += 16 - strlen(botBuiltinId(i));
   slack += 2 * BOT_JN_DBL - measureJson(doc["lat"]) - measureJson(doc["lon"]);
-  slack += BOT_MAX_CUSTOM * strlen("http://a?") + BOT_MAX_CHANNELS + 1 + 4;
+  slack += BOT_MAX_CUSTOM * strlen("http://a?") + BOT_MAX_CHANNELS + 1 + 5;
   slack += 1;   // mqtt_wait_s 15 is two digits, the bound counts three
   EXPECT_EQ(n + slack, BOT_CONFIG_JSON_MAX) << n;
   // The page never receives the password salt or hash.

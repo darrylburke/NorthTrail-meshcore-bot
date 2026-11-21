@@ -501,7 +501,7 @@ static std::string refusedByDocuments(JsonObjectConst posted, const BotConfig& b
     if (legacy) { one.add(kv.value()); pv = one.as<JsonVariantConst>(); }
     JsonVariantConst bv = b[dk];
     if (bv.isNull() || a[dk] != bv || pv == bv) continue;
-    if ((rep.custom[0] && strcmp(kv.key().c_str(), "custom") == 0) || (rep.builtin[0] && strcmp(kv.key().c_str(), "builtin") == 0) ||
+    if ((rep.match[0] && strcmp(kv.key().c_str(), "match") == 0) || (rep.custom[0] && strcmp(kv.key().c_str(), "custom") == 0) || (rep.builtin[0] && strcmp(kv.key().c_str(), "builtin") == 0) ||
         (rep.watch[0] && strcmp(kv.key().c_str(), "watch") == 0) || (rep.channels[0] && strcmp(dk, "channels") == 0))
       continue;
     size_t n = strlen(refused);
@@ -515,6 +515,7 @@ static BotConfig* richConfig() {
   c->lat = 44.2312; c->lon = -76.486; strcpy(c->scope, "test-region"); strcpy(c->help_link, "https://example.org/h");
   applyTo(*c, "{\"custom\":[{\"trigger\":\"one\",\"reply\":\"1 {fetch}\",\"desc\":\"d\",\"enabled\":true,\"url\":\"https://example.org/a?q={args}\",\"path\":\"a.b[0]\",\"cache_s\":60},"
               "{\"trigger\":\"two\",\"reply\":\"2\",\"enabled\":false}],"
+              "\"match\":[{\"kind\":\"exact\",\"text\":\"good morning\",\"run\":\"one\",\"enabled\":true},{\"kind\":\"regex\",\"text\":\"^w (.+)$\",\"run\":\"wx {1}\",\"enabled\":false}],"
               "\"watch\":[{\"label\":\"Obs\",\"kind\":\"observer\",\"id\":\"0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d\"},"
               "{\"label\":\"Node\",\"kind\":\"node\",\"id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}");
   return c;
@@ -541,6 +542,10 @@ TEST(RefusedKeys, MatchesWholeDocumentComparison) {
     "{\"watch\":[{\"label\":\"Obs\",\"kind\":\"observer\",\"id\":\"0A1B2C3D-4E5F-6A7B-8C9D-0E1F2A3B4C5D\"},{\"label\":\"Node\",\"kind\":\"node\",\"id\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}]}",
     "{\"watch\":[{\"label\":\"\",\"kind\":\"observer\",\"id\":\"x\"}]}",
     "{\"watch\":{}}",
+    "{\"bare\":true}", "{\"bare\":false}", "{\"bare\":1}",
+    "{\"match\":[{\"kind\":\"exact\",\"text\":\"good morning\",\"run\":\"one\",\"enabled\":true},{\"kind\":\"regex\",\"text\":\"^w (.+)$\",\"run\":\"wx {1}\",\"enabled\":false}]}",
+    "{\"match\":[{\"kind\":\"regex\",\"text\":\"a{2}\",\"run\":\"wx\"}]}",
+    "{\"match\":[]}", "{\"match\":7}",
     "{\"web_hash\":\"00\",\"web_salt\":\"11\",\"unknown\":1}",
     "{\"prefix\":\"?\",\"tz\":\"UTC\",\"channel\":\"Public\",\"scope\":\"\"}",
     "{\"tz\":\"America/Toronto\",\"ignore\":\"bot\",\"prefix\":\"!\",\"channel\":\"#bot\"}",
@@ -939,6 +944,36 @@ TEST(MqttMove, KeptWhenNotMovedOrSetInTheSameRequest){
 }
 TEST(MqttMove, MessageWords){
   EXPECT_STREQ(BOT_MQTT_PASS_CLEARED_MSG,"broker changed: password cleared, enter it again");
+}
+
+TEST(CfgMatch, RulesLoadRoundTripAndRefuse) {
+  BotConfig* c = heapDefaults();
+  EXPECT_FALSE(c->bare); EXPECT_EQ(c->num_match, 0);
+  applyTo(*c, "{\"bare\":true,\"match\":[{\"kind\":\"exact\",\"text\":\"good morning\",\"run\":\"gm\"},"
+              "{\"kind\":\"regex\",\"text\":\"^weather (.+)$\",\"run\":\"wx {1}\",\"enabled\":false},"
+              "{\"kind\":\"regex\",\"text\":\"(\",\"run\":\"wx\"},{\"kind\":\"glob\",\"text\":\"x\",\"run\":\"wx\"},"
+              "{\"kind\":\"exact\",\"text\":\"x\",\"run\":\"!wx\"},{\"kind\":\"exact\",\"text\":\"@[a] x\",\"run\":\"wx\"},7]}");
+  EXPECT_TRUE(c->bare);
+  ASSERT_EQ(c->num_match, 2);   // the file loader skips the bad ones
+  EXPECT_EQ(c->match[0].kind, BMK_EXACT); EXPECT_TRUE(c->match[0].enabled); EXPECT_STREQ(c->match[0].text, "good morning"); EXPECT_STREQ(c->match[0].run, "gm");
+  EXPECT_EQ(c->match[1].kind, BMK_REGEX); EXPECT_FALSE(c->match[1].enabled); EXPECT_STREQ(c->match[1].run, "wx {1}");
+  JsonDocument d; ASSERT_TRUE(botConfigToJsonChecked(*c, d, true));
+  BotConfig* r = heapDefaults(); botConfigFromJson(d.as<JsonVariantConst>(), *r);
+  EXPECT_EQ(memcmp(c, r, sizeof *c), 0);
+  // The web path takes a list whole or not at all, and says why.
+  BotApplyReport rep;
+  JsonDocument p; deserializeJson(p, "{\"match\":[{\"kind\":\"exact\",\"text\":\"hi\",\"run\":\"ping\"},{\"kind\":\"regex\",\"text\":\"a{2}\",\"run\":\"wx\"}]}");
+  botConfigFromWebJsonStrict(p.as<JsonVariantConst>(), *c, rep);
+  EXPECT_EQ(c->num_match, 2); EXPECT_STREQ(c->match[0].run, "gm");
+  EXPECT_EQ(std::string(rep.match).rfind("#2: ", 0), 0u) << rep.match;
+  std::string nine = "{\"match\":[";
+  for (int i = 0; i < 9; i++) nine += std::string(i ? "," : "") + "{\"kind\":\"exact\",\"text\":\"t" + std::to_string(i) + "\",\"run\":\"ping\"}";
+  nine += "]}";
+  deserializeJson(p, nine); botConfigFromWebJsonStrict(p.as<JsonVariantConst>(), *c, rep);
+  EXPECT_EQ(c->num_match, 2); EXPECT_STREQ(rep.match, "#9: at most 8 text rules");
+  deserializeJson(p, "{\"match\":[]}"); botConfigFromWebJsonStrict(p.as<JsonVariantConst>(), *c, rep);
+  EXPECT_EQ(c->num_match, 0); EXPECT_STREQ(rep.match, "");
+  delete c; delete r;
 }
 
 int main(int argc, char** argv) {

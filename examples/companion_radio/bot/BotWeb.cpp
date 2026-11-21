@@ -418,11 +418,12 @@ void BotWeb::applyConfigReq(uint8_t& status, char* msg, size_t cap) {
   if (!saved) {
     status = RS_NOT_SAVED;
     snprintf(msg, cap, "In use now, but saving to flash failed: the change is lost at restart");
-  } else if (rep.channels[0] || rep.custom[0] || rep.watch[0] || rep.builtin[0] || refused[0]) {
+  } else if (rep.channels[0] || rep.custom[0] || rep.watch[0] || rep.match[0] || rep.builtin[0] || refused[0]) {
     status = RS_PARTIAL;
     if (rep.channels[0]) snprintf(msg, cap, "Channels not changed: %s", rep.channels);
     else if (rep.custom[0]) snprintf(msg, cap, "Custom commands not changed: %s", rep.custom);
     else if (rep.watch[0]) snprintf(msg, cap, "Watched nodes not changed: %s", rep.watch);
+    else if (rep.match[0]) snprintf(msg, cap, "Text rules not changed: %s", rep.match);
     else if (rep.builtin[0]) snprintf(msg, cap, "Saved, except: %s", rep.builtin);
     else snprintf(msg, cap, "Saved, but some values were not accepted: %s", refused);
   } else {

@@ -90,6 +90,13 @@ TEST(BotClamp, SweepNeverSplitsOrOverruns) {
   }
 }
 
+TEST(BotParse, BareWordsInAChannelNeedTheSwitchAndAKnownCommand) {
+  EXPECT_TRUE(botBareTaken(true, false, false));    // a direct message, as before
+  EXPECT_FALSE(botBareTaken(false, false, true));   // channel, switch off
+  EXPECT_FALSE(botBareTaken(false, true, false));   // channel, ordinary chat
+  EXPECT_TRUE(botBareTaken(false, true, true));
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

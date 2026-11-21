@@ -11,6 +11,41 @@ static uint32_t fixed(uint32_t m){ return m>2 ? 2 : 0; }           // every die 
 static const char* look(const uint8_t* h,uint8_t n,void*){ return (n==3&&h[0]==0xa5) ? "Vincent Repeater" : nullptr; }
 
 TEST(Fmt, Ping)          { char b[128]; botFmtPing(b,128,M(3)); EXPECT_STREQ(b,"@[Dee] 3 hops, SNR 7.5"); }
+TEST(Fmt, PingPathListsEachRepeaterOnALine) {
+  char b[128];
+  size_t n = botFmtPingPath(b,128,M(2),look,nullptr,110); EXPECT_EQ(n, strlen(b));
+  EXPECT_STREQ(b,"@[Dee] 2 hops, SNR 7.5\na53e96: Vincent Repeater\nbcadb8: ?");
+  botFmtPingPath(b,128,M(1),nullptr,nullptr,110); EXPECT_STREQ(b,"@[Dee] 1 hop, SNR 7.5\na53e96: ?");
+  BotMsgInfo d=M(2); d.direct=true; botFmtPingPath(b,128,d,look,nullptr,110); EXPECT_STREQ(b,"@[Dee] direct, SNR 7.5");
+  botFmtPingPath(b,128,M(0),look,nullptr,110); EXPECT_STREQ(b,"@[Dee] 0 hops, SNR 7.5");
+  char z[1]={'x'}; EXPECT_EQ(botFmtPingPath(z,0,M(2),look,nullptr,110),0u); EXPECT_EQ(z[0],'x');
+}
+TEST(Fmt, PingPathKeepsWholeLinesAndCountsTheRest) {
+  static uint8_t path[64]; for (int i=0;i<64;i++) path[i]=(uint8_t)(0x10+i);
+  BotMsgInfo m = {"Dee",23,2,path,-4.5f,-98,false};
+  char b[208];
+  for (size_t limit = 0; limit <= 207; limit++) {
+    size_t n = botFmtPingPath(b,sizeof b,m,nullptr,nullptr,limit);
+    std::string s(b);
+    ASSERT_EQ(n, s.size());
+    if (limit >= 24) ASSERT_LE(n, limit) << limit;   // the first line alone is 24 bytes
+    // Every line after the first is "hhhh: ?" or, last, "+N more"; the lines shown and N make 23.
+    int shown = 0, more = 0; size_t pos = s.find('\n');
+    while (pos != std::string::npos) {
+      size_t end = s.find('\n', pos + 1);
+      std::string line = s.substr(pos + 1, end == std::string::npos ? std::string::npos : end - pos - 1);
+      if (line[0] == '+') { more = atoi(line.c_str() + 1); ASSERT_EQ(end, std::string::npos); ASSERT_EQ(line, "+" + std::to_string(more) + " more"); }
+      else { ASSERT_EQ(line.size(), 7u) << s; ASSERT_EQ(line.substr(4), ": ?"); shown++; }
+      pos = end;
+    }
+    if (s.find('\n') != std::string::npos) ASSERT_EQ(shown + more, 23) << limit << " " << s;
+  }
+  botFmtPingPath(b,sizeof b,m,nullptr,nullptr,60);
+  EXPECT_STREQ(b,"@[Dee] 23 hops, SNR -4.5\n1011: ?\n1213: ?\n1415: ?\n+20 more");
+  char big[256]; botFmtPingPath(big,sizeof big,m,nullptr,nullptr,208);
+  EXPECT_EQ(std::string(big).size(), 208u);
+  EXPECT_EQ(std::string(big).substr(201), "3c3d: ?");   // all 23 fit in exactly 208
+}
 TEST(Fmt, PingSingular)  { char b[128]; botFmtPing(b,128,M(1)); EXPECT_STREQ(b,"@[Dee] 1 hop, SNR 7.5"); }
 TEST(Fmt, SnrTrimmed)    { char b[128]; BotMsgInfo m=M(2); m.snr=-7.0f; botFmtPing(b,128,m); EXPECT_STREQ(b,"@[Dee] 2 hops, SNR -7"); m.snr=11.25f; botFmtPing(b,128,m); EXPECT_STREQ(b,"@[Dee] 2 hops, SNR 11.25"); }
 TEST(Fmt, Test)          { char b[128]; botFmtTest(b,128,M(2)); EXPECT_STREQ(b,"@[Dee] ack | a53e96,bcadb8 (2 hops) | SNR 7.5 | RSSI -98"); }

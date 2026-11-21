@@ -443,8 +443,10 @@ static inline int botGuard(const BotReqFacts& f) {
 //    itself is not in the web document, only mqtt_pass_set.
 //  - the punctuation and keys of each object are the literal text below with the values
 //    removed (sizeof - 1), plus one comma per array element / object member.
-// With BotConfig as it stands (4 channels, 16 custom commands, 4 watch entries, 14 built-ins)
-// this comes to 16,998 bytes: per channel 65 (the name 64, comma 1), per custom command 887
+// With BotConfig as it stands (4 channels, 16 custom commands, 8 text rules, 4 watch entries,
+// 14 built-ins) this comes to 18,974 bytes, of which the bare switch and the text rules are 1,976
+// (keys 19, the switch 5, per rule 244 = text 98, run 98, kind 7, enabled 5, keys and comma 36).
+// Without those: per channel 65 (the name 64, comma 1), per custom command 887
 // (trigger 18, reply 322, desc 98, url 322, path 50, two small values 10, keys and comma 67), per
 // watch entry 151, per built-in 63, the rest 1,060 (742 before the broker settings, which add
 // 318: their keys and commas 102, values 216 = enabled 5, host 66, port 5, user 66, prefix 66,
@@ -467,17 +469,21 @@ static const size_t BOT_CFG_JSON_CUSTOM_MAX =
 static const size_t BOT_CFG_JSON_WATCH_MAX =
     (sizeof("{\"label\":,\"kind\":,\"id\":}") - 1) + BOT_JS_ESC(BOT_FSZ(BotWatchCfg, label)) +
     (sizeof("\"observer\"") - 1) + BOT_JS_PLAIN(BOT_FSZ(BotWatchCfg, id)) + 1;
+static const size_t BOT_CFG_JSON_MATCH_MAX =
+    (sizeof("{\"kind\":,\"text\":,\"run\":,\"enabled\":}") - 1) + (sizeof("\"regex\"") - 1) +
+    BOT_JS_ESC(BOT_FSZ(BotMatchRule, text)) + BOT_JS_ESC(BOT_FSZ(BotMatchRule, run)) + BOT_JN_BOOL + 1;
 static const size_t BOT_CFG_JSON_CHANNEL_MAX =   // "..",
     BOT_JS_ESC(BOT_FSZ(BotConfig, channels[0])) + 1;
 static const size_t BOT_CONFIG_JSON_MAX =
     (sizeof("{\"channels\":[],\"scope\":,\"prefix\":,\"cooldown_s\":,\"max_per_min\":,\"ignore\":,\"lat\":,\"lon\":,"
-            "\"tz\":,\"help_link\":,\"advert_zero_hop_min\":,\"advert_flood_min\":,\"builtin\":{},\"custom\":[],"
+            "\"tz\":,\"help_link\":,\"advert_zero_hop_min\":,\"advert_flood_min\":,\"builtin\":{},\"custom\":[],\"bare\":,\"match\":[],"
             "\"watch\":[],\"watch_online_min\":,\"mqtt_enabled\":,\"mqtt_host\":,\"mqtt_port\":,\"mqtt_user\":,"
             "\"mqtt_prefix\":,\"mqtt_wait_s\":,\"mqtt_pass_set\":}") - 1) +
     BOT_MAX_CHANNELS * BOT_CFG_JSON_CHANNEL_MAX + BOT_JS_ESC(BOT_FSZ(BotConfig, scope)) + BOT_JS_ESC(2) +
     BOT_JN_U16 + BOT_JN_U8 + BOT_JS_ESC(BOT_FSZ(BotConfig, ignore)) + 2 * BOT_JN_DBL +
     BOT_JS_ESC(BOT_FSZ(BotConfig, tz)) + BOT_JS_ESC(BOT_FSZ(BotConfig, help_link)) + 2 * BOT_JN_U16 +
     BB_COUNT * BOT_CFG_JSON_BUILTIN_MAX + BOT_MAX_CUSTOM * BOT_CFG_JSON_CUSTOM_MAX +
+    BOT_JN_BOOL + BOT_MAX_MATCH * BOT_CFG_JSON_MATCH_MAX +
     BOT_MAX_WATCH * BOT_CFG_JSON_WATCH_MAX + BOT_JN_U16 +
     BOT_JN_BOOL + BOT_JS_PLAIN(BOT_FSZ(BotConfig, mqtt_host)) + BOT_JN_U16 + BOT_JS_ESC(BOT_FSZ(BotConfig, mqtt_user)) +
     BOT_JS_PLAIN(BOT_FSZ(BotConfig, mqtt_prefix)) + BOT_JN_U8 + BOT_JN_BOOL;

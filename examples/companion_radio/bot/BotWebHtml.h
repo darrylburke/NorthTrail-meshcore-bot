@@ -87,7 +87,8 @@ code{overflow-wrap:anywhere}
 <div class="tryrow"><div style="flex:1"><label for="t_text">Command</label><input id="t_text" maxlength="120" placeholder="wx" autocomplete="off"></div>
 <button id="t_go">Try</button></div>
 <div id="t_out" class="msg"></div>
-<p id="t_mqnote" class="note hide">To try a broker command, type it with the prefix.</p>
+<p class="note">Text rules are tried too: type the message a rule should catch.</p>
+<p id="t_mqnote" class="note hide">To try a broker command, type it with the prefix (or without, when commands without the prefix are allowed).</p>
 </section>
 
 <section><h2>Settings</h2>
@@ -99,6 +100,8 @@ code{overflow-wrap:anywhere}
 <label>Region scope</label><input id="c_scope" maxlength="30">
 <div class="row"><div><label>Command prefix</label><input id="c_prefix" maxlength="1"></div>
 <div><label>Cooldown per sender (seconds)</label><input id="c_cooldown_s" type="number" min="0" max="3600"></div></div>
+<label class="chk"><input type="checkbox" id="c_bare"> Also answer commands written without the prefix</label>
+<p class="note">With this on, <code>ping</code> works like <code>!ping</code> in channels (direct messages never need the prefix for the bot's own commands), and a command from the broker also works without it, in channels and direct messages. Only a message that starts with the name of a command is answered, so a chat line that happens to start with one (“test again later”) is answered too.</p>
 <label>Replies per minute, at most</label><input id="c_max_per_min" type="number" min="1" max="30">
 <label>Ignore senders whose name contains (comma separated)</label><input id="c_ignore" maxlength="95">
 <div class="row"><div><label>Latitude</label><input id="c_lat" inputmode="decimal"></div>
@@ -127,6 +130,13 @@ code{overflow-wrap:anywhere}
 <button class="sec" id="u_add">Add command</button><button id="u_save">Save custom commands</button>
 <div id="u_msg" class="msg"></div></section>
 
+<section><h2>Text rules</h2>
+<p class="note">Answer a message that is not written as a command. Each rule names the text to look for and the command to run when it is found, exactly as if that command had been sent: a built-in, a custom command or one from the broker. Rules are tried from the top, before the message is read as a command; the first that fits wins. Replies from bots (starting @[) are never matched.</p>
+<p class="note"><b>Exact text</b>: the whole message, capitals and outer spaces ignored (it may include the prefix, such as <code>!gm</code>). <b>Pattern</b>: a regular expression found anywhere in the message; use ^ and $ for the start and end. In the command, {0} is the text found and {1} to {9} the pattern's groups: <code>^weather (?:in )?(.+)$</code> with <code>wx {1}</code>. Supported: <code>. ^ $ \b \d \w \s [a-z] [^,] ( ) (?: ) | * + ?</code>; capitals are ignored. A pattern that needs too much work on a message is given up as no match: a repeated group such as <code>(\w+ )+</code> stops matching after about a dozen rounds, so prefer <code>.*</code> or a set such as <code>[a-z ]*</code>.</p>
+<div id="x_list"></div><p id="x_none" class="note hide">No text rules yet.</p>
+<button class="sec" id="x_add">Add a rule</button><button id="x_save">Save text rules</button>
+<div id="x_msg" class="msg"></div></section>
+
 <section><h2>Watched nodes</h2>
 <p class="note">The nodes command says which of these were heard recently. An observer's id is the UUID in its analyzer address; a node's id is its 64-character public key.</p>
 <p class="note">Checking these sends their ids to live.meshcore.ca.</p>
@@ -137,7 +147,7 @@ code{overflow-wrap:anywhere}
 <section id="mqtt" class="hide"><h2>Broker (MQTT)</h2>
 <p class="note bad">The connection to the broker is not encrypted. Use a broker on your own network, with a user name and password made only for this bot.</p>
 <p class="note">Anything typed after an unknown command is sent to the broker, and whatever answers there is sent on the mesh under this bot's name.</p>
-<p class="note">A command the bot does not know is sent to the broker with the sender's name, key, position if known, the message's route and signal figures. In a direct message this happens only when the command starts with the prefix. Commands you have switched off are never sent.</p>
+<p class="note">A command the bot does not know is sent to the broker with the sender's name, key, position if known, the message's route and signal figures. A command written without the prefix is sent only when commands without the prefix are allowed and a program on the broker has announced that name; a text rule's command is sent like one written with the prefix. Commands you have switched off are never sent.</p>
 <p id="m_state"></p><p id="m_counts" class="note"></p>
 <label class="chk"><input type="checkbox" id="m_enabled"> Answer unknown commands through the broker</label>
 <label for="m_host">Broker host</label><input id="m_host" maxlength="64" placeholder="broker.example.org" autocomplete="off" spellcheck="false">
@@ -180,7 +190,7 @@ const $=id=>document.getElementById(id);
 const ZONES=["America/St_Johns","America/Halifax","America/Toronto","America/Winnipeg","America/Regina","America/Edmonton","America/Vancouver","UTC"];
 // What each built-in does, for the labels only. The list of built-ins itself comes from the
 // node (the keys of config.builtin, in its order), so a new one appears without a page change.
-const BDESC={ping:"pong",test:"signal report",path:"the route a message took",help:"lists the commands",heard:"nodes heard lately",
+const BDESC={ping:"hops, signal and route",test:"signal report",path:"the route a message took",help:"lists the commands",heard:"nodes heard lately",
   mesh:"traffic on the mesh",dist:"distance to the sender",sun:"sunrise and sunset",roll:"dice",
   "8ball":"magic 8-ball",wx:"weather",aurora:"aurora (Kp) outlook",alerts:"weather alerts",nodes:"watched nodes online"};
 let S=null,C=null,wasAuthed=false;
@@ -294,7 +304,7 @@ async function load(full){
     if(!c||c.code!==200||!c.j||!c.j.builtin){busy(full);return}
     C=c.j}
   S=st;wasAuthed=true;$("l_note").textContent="";
-  show("dash");status();node();recent();mqttStatus();if(full){settings();builtins();customs();watches();mqttForm()}
+  show("dash");status();node();recent();mqttStatus();if(full){settings();builtins();customs();matches();watches();mqttForm()}
 }
 function status(){const s=S.status;
   let net="look-ups "+(s.net_busy?"running":"idle");
@@ -386,7 +396,7 @@ const NUMS=["cooldown_s","max_per_min","advert_zero_hop_min","advert_flood_min",
 function settings(){const c=C;
   FIELDS.forEach(f=>$("c_"+f).value=c[f]===undefined?"":c[f]);$("c_lat").value=r5(c.lat);$("c_lon").value=r5(c.lon);$("c_node_name").value=S.node.name;
   const z=$("c_tz");z.textContent="";const list=ZONES.indexOf(c.tz)<0&&c.tz?ZONES.concat([c.tz]):ZONES;
-  list.forEach(t=>z.appendChild(el("option",{value:t,textContent:t})));z.value=c.tz||"UTC";channels()}
+  list.forEach(t=>z.appendChild(el("option",{value:t,textContent:t})));z.value=c.tz||"UTC";$("c_bare").checked=c.bare===true;channels()}
 
 // ---- built-in commands (the list is the node's) ----
 const bids=()=>Object.keys(C.builtin);
@@ -434,6 +444,32 @@ function checkCustoms(list){
       if(!jsonPathCheck(c.path))return row+"the value to read is not a valid JSON path (keys of letters, digits, _ or -, joined by dots, each optionally followed by [n]; at most 10 keys and indices)";
       if(!Number.isInteger(c.cache_s)||c.cache_s<0||c.cache_s>3600)return row+"reuse for must be a whole number of seconds from 0 to 3600"}
     if(c.reply.indexOf("{fetch}")>=0&&!c.url)return row+"the reply uses {fetch}, which needs a web address (turn on the look-up)"}
+  return null}
+
+// ---- text rules ----
+function matchRow(r){const d=el("div",{className:"item"});
+  const kind=el("select",{className:"x_k"},[el("option",{value:"exact",textContent:"Exact text"}),el("option",{value:"regex",textContent:"Pattern (regular expression)"})]);
+  kind.value=r.kind==="regex"?"regex":"exact";
+  d.appendChild(el("div",{className:"row"},[
+    el("div",null,[el("label",null,["When a message"]),kind]),
+    el("div",null,[el("label",null,["Text or pattern"]),el("input",{className:"x_t",value:r.text||"",maxLength:48,autocomplete:"off",spellcheck:false})])]));
+  d.appendChild(el("label",null,["Run this command (no prefix)"]));d.appendChild(el("input",{className:"x_r",value:r.run||"",maxLength:48,placeholder:"wx {1}",autocomplete:"off",spellcheck:false}));
+  d.appendChild(el("label",{className:"chk"},[el("input",{type:"checkbox",className:"x_e",checked:r.enabled!==false})," Enabled"]));
+  const del=el("button",{className:"sec",textContent:"Delete"});del.onclick=()=>{d.remove();matchesEmpty()};d.appendChild(del);return d}
+function matchesEmpty(){const n=document.querySelectorAll("#x_list .item").length;$("x_none").classList.toggle("hide",n>0);$("x_add").disabled=n>=8}
+function matches(){const l=$("x_list");l.textContent="";(C.match||[]).forEach(r=>l.appendChild(matchRow(r)));matchesEmpty()}
+// A first check of the rule list; the node checks again and its word on a pattern is final.
+function checkMatches(list){
+  if(list.length>8)return"At most 8 text rules ("+list.length+" now)";
+  for(let i=0;i<list.length;i++){const r=list[i],row="Rule "+(i+1)+": ";
+    if(!r.text.trim())return row+"the text is empty";
+    if(CTRL.test(r.text)||CTRL.test(r.run))return row+"remove the control characters";
+    if(utf8len(r.text)>48)return row+"the text is "+utf8len(r.text)+" bytes, at most 48";
+    if(utf8len(r.run)>48)return row+"the command is "+utf8len(r.run)+" bytes, at most 48";
+    if(r.kind==="exact"&&/^\s*@\[/.test(r.text))return row+"the text must not start with @[ (a bot's reply)";
+    if(r.kind==="regex"){try{new RegExp(r.text)}catch(e){return row+"the pattern is not valid ("+e.message+")"}
+      if(/(^|[^\\])(\\\\)*[{}]/.test(r.text))return row+"{ } repeats are not supported in a pattern (write \\{ for a brace)"}
+    if(!/^[A-Za-z0-9]{1,16}( |$)/.test(r.run))return row+"the command must start with a command name of 1 to 16 letters or digits, without the prefix"}
   return null}
 
 // ---- watched nodes ----
@@ -523,7 +559,7 @@ $("t_text").onkeydown=e=>{if(e.key==="Enter"&&!$("t_go").disabled)tryCmd()};
 $("c_chadd").onclick=()=>{if(chInputs().length>=chMax())return;const r=chRow("");$("c_chlist").appendChild(r);chRows();r.querySelector(".c_ch").focus()};
 $("c_save").onclick=()=>{const b={};FIELDS.forEach(f=>b[f]=$("c_"+f).value);
   NUMS.forEach(f=>b[f]=num(b[f]));
-  b.channels=chInputs().map(i=>i.value.trim());
+  b.channels=chInputs().map(i=>i.value.trim());b.bare=$("c_bare").checked;
   const bad=checkChannels(b.channels,chMax());if(bad){say("c_msg",bad+". Nothing was saved.",false);return}
   if(!Array.isArray(C.channels))b.channel=b.channels[0];   // a firmware older than the list knows only this key
   b.lat=num($("c_lat").value);b.lon=num($("c_lon").value);b.tz=$("c_tz").value;b.node_name=$("c_node_name").value.trim();
@@ -542,6 +578,11 @@ $("u_save").onclick=()=>{const list=[];document.querySelectorAll("#u_list .item"
     cache_s:look?num(d.querySelector(".u_cache").value):0})});
   const bad=checkCustoms(list);if(bad){say("u_msg",bad+". Nothing was saved.",false);return}
   submit("/api/config",{custom:list},"u_msg",()=>load(true))};
+$("x_add").onclick=()=>{if(document.querySelectorAll("#x_list .item").length>=8)return;$("x_list").appendChild(matchRow({}));matchesEmpty()};
+$("x_save").onclick=()=>{const list=[];document.querySelectorAll("#x_list .item").forEach(d=>{const k=d.querySelector(".x_k").value,t=d.querySelector(".x_t").value;
+  list.push({kind:k,text:k==="exact"?t.trim():t,run:d.querySelector(".x_r").value.trim(),enabled:d.querySelector(".x_e").checked})});
+  const bad=checkMatches(list);if(bad){say("x_msg",bad+". Nothing was saved.",false);return}
+  submit("/api/config",{match:list},"x_msg",()=>load(true))};
 $("w_add").onclick=()=>{if(document.querySelectorAll("#w_list .item").length>=4)return;$("w_list").appendChild(watchRow({}));watchesEmpty()};
 $("w_save").onclick=()=>{const list=[];document.querySelectorAll("#w_list .item").forEach(d=>list.push({label:d.querySelector(".w_l").value.trim(),
   kind:d.querySelector(".w_k").value,id:d.querySelector(".w_i").value.trim()}));

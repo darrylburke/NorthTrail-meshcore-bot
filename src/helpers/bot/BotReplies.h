@@ -127,6 +127,39 @@ static inline size_t botFmtPing(char* dst, size_t cap, const BotMsgInfo& m) {
   return o.n;
 }
 
+// The ping reply followed by the route the message took, one repeater to a line:
+//   "@[Dee] 3 hops, SNR 7.5\na53e: Vincent Repeater\nbcad: ?\n07f2: Hilltop"
+// "?" stands for a repeater the node has no name for (fn null or returning none). Only whole
+// lines are written; when the reply (at most limit bytes, and cap - 1) cannot hold them all, the
+// last line says how many are left out: "+4 more". A direct or zero-hop message has no lines.
+static inline size_t botFmtPingPath(char* dst, size_t cap, const BotMsgInfo& m, BotNameLookup fn, void* ctx, size_t limit) {
+  size_t n = botFmtPing(dst, cap, m);
+  if (!dst || cap == 0 || botPathUnknown(m)) return n;
+  if (limit > cap - 1) limit = cap - 1;
+  for (uint8_t i = 0; i < m.hops; i++) {
+    const uint8_t* h = m.path + (size_t)i * m.hash_size;
+    char line[48];
+    BotOut o = botOutInit(line, sizeof(line));
+    botOutAppend(o, "\n");
+    botOutHash(o, h, m.hash_size, false);
+    botOutAppend(o, ": ");
+    const char* name = fn ? fn(h, m.hash_size, ctx) : nullptr;
+    botOutAppend(o, (name && *name) ? name : "?");
+    unsigned left = (unsigned)(m.hops - i - 1);
+    char more[16] = "";
+    if (left) snprintf(more, sizeof(more), "\n+%u more", left);
+    if (n + o.n + strlen(more) > limit) {   // this line and a note for the rest do not both fit
+      snprintf(more, sizeof(more), "\n+%u more", left + 1);
+      size_t ml = strlen(more);
+      if (n + ml <= limit) { memcpy(dst + n, more, ml + 1); n += ml; }
+      break;
+    }
+    memcpy(dst + n, line, o.n + 1);
+    n += o.n;
+  }
+  return n;
+}
+
 // "@[Dee] ack | a53e96,bcadb8 (2 hops) | SNR 7.5 | RSSI -98"; "Direct" has no hop count.
 // The mention comes first, like every reply, so it is never added a second time.
 static inline size_t botFmtTest(char* dst, size_t cap, const BotMsgInfo& m) {

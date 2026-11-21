@@ -23,7 +23,7 @@ static const uint32_t BOT_FIRST_ADVERT_MS = 60000u;
 
 // Fixed one-liners for "help <cmd>", by BotBuiltin id.
 static const char* const BOT_BUILTIN_HELP[] = {
-  "hops and signal of your message",       // ping
+  "hops, signal and route of your message", // ping
   "path, SNR and RSSI of your message",    // test
   "repeaters your message came through",   // path
   "list commands",                         // help
@@ -328,7 +328,7 @@ void BotTask::handle(mesh::Packet* pkt, const char* raw_sender, const char* body
   bool is_dm = dm_from != nullptr;
   if (botIsIgnored(raw_sender, _mesh.getNodeName(), _cfg.ignore)) return;
   BotParsed p;
-  if (!botParse(body, _cfg.prefix, is_dm, p)) return;
+  if (!resolve(body, is_dm, p)) return;
   uint32_t now_ms = millis();
   if (!_cooldown.allow(raw_sender, now_ms, (uint32_t)_cfg.cooldown_s * 1000u)) return;
   // The name as it may be echoed on air: no control characters.
@@ -351,11 +351,34 @@ void BotTask::handle(mesh::Packet* pkt, const char* raw_sender, const char* body
   process(p, m, d, sender, body, dm_from, channel, now_ms);
 }
 
+// What a message asks for, if anything. A text rule is tried first: the message then stands for
+// the command line the owner gave it, exactly as if that had been sent with the prefix (so it may
+// also go to the broker). Otherwise the message is read as a command; without the prefix it
+// counts in a direct message, and in a channel only by botBareTaken. A bare word that a program on
+// the broker has announced is offered to the broker when bare commands are allowed.
+bool BotTask::resolve(const char* body, bool is_dm, BotParsed& p) {
+  if (botMatchFind(_cfg.match, _cfg.num_match, body, _line, sizeof(_line)) >= 0) {
+    if (!botParse(_line, _cfg.prefix, true, p)) return false;
+    p.prefixed = true;
+    return true;
+  }
+  if (!botParse(body, _cfg.prefix, is_dm || _cfg.bare, p)) return false;
+  if (p.prefixed) return true;
+  bool own = false;
+  for (int i = 0; i < BB_COUNT && !own; i++) own = _cfg.builtin[i].enabled && strcmp(_cfg.builtin[i].name, p.cmd) == 0;
+  for (int i = 0; i < _cfg.num_custom && i < BOT_MAX_CUSTOM && !own; i++)
+    own = _cfg.custom[i].enabled && strcmp(_cfg.custom[i].trigger, p.cmd) == 0;
+  bool announced = !own && _mqtt.ready() && _mqtt.commands().find(p.cmd) != nullptr;
+  if (!botBareTaken(is_dm, _cfg.bare, own || announced)) return false;
+  if (_cfg.bare && announced) p.prefixed = true;
+  return true;
+}
+
 bool BotTask::tryCommand(const char* text, uint32_t id) {
   uint32_t now_ms = millis();
   if (!text || !_try.begin(id, now_ms)) return false;   // one at a time
   BotParsed p;
-  if (!botParse(text, _cfg.prefix, true, p)) {
+  if (!resolve(text, true, p)) {
     _try.complete(id, "");   // not a command: the bot would stay silent
     return true;
   }
@@ -671,7 +694,7 @@ bool BotTask::buildReply(int builtin, int custom, const BotParsed& p, const BotM
     botRender(_tmp, sizeof(_tmp), _cfg.custom[custom].reply, v);
   } else {
     switch (builtin) {
-      case BB_PING:  botFmtPing(_tmp, sizeof(_tmp), m); break;
+      case BB_PING:  botFmtPingPath(_tmp, sizeof(_tmp), m, lookupPathName, this, max_bytes); break;
       case BB_TEST:  botFmtTest(_tmp, sizeof(_tmp), m); break;
       case BB_PATH:  botFmtPath(_tmp, sizeof(_tmp), m, lookupPathName, this); break;
       case BB_HELP:  return buildHelp(_args, out, out_cap, body_max) > 0;               // pages fit by design

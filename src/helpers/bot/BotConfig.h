@@ -9,6 +9,7 @@
 #include "BotUrl.h"
 #include "BotJsonPath.h"
 #include "BotMqttTopics.h"
+#include "BotMatch.h"
 
 // Settings model for the chat bot: one struct, its defaults, and strict JSON load/save.
 // Only ArduinoJson is used besides plain C; no heap of our own. BotConfig is ~9 KB, so
@@ -46,6 +47,9 @@ struct BotConfig {
   BotBuiltinCfg builtin[BB_COUNT];   // default names: ping test path help heard mesh dist sun roll 8ball wx aurora alerts nodes, all enabled
   BotCustomCmd  custom[BOT_MAX_CUSTOM];
   uint8_t num_custom;
+  bool bare;               // false: a channel command needs the prefix. true: a known command also answers without it
+  BotMatchRule match[BOT_MAX_MATCH];   // text rules, tried in order before the message is read as a command
+  uint8_t num_match;
   BotWatchCfg watch[BOT_MAX_WATCH];
   uint8_t num_watch;
   uint16_t watch_online_min;  // 720  (5..10080)
@@ -220,6 +224,7 @@ struct BotApplyReport {
   char builtin[112];   // "" or the first refused built-in rename and why
   char watch[112];     // "" or "#<position> '<label>': <reason>" for a refused watch list
   char channels[112];  // "" or "empty list" or "#<position>[ '<name>']: <reason>" for a refused channel list
+  char match[160];     // "" or "#<position>: <reason>" for a refused text-rule list
 };
 
 // A posted string as shown in a message: printable ASCII kept, other bytes as '?', at most
@@ -432,6 +437,42 @@ static inline bool botCustomListVsBuiltins(JsonArrayConst arr, const char names[
   return true;
 }
 
+// One posted text rule: nullptr when valid (a zero-filled copy in out), else why not.
+static inline const char* botMatchElemError(JsonVariantConst e, BotMatchRule& out) {
+  memset(&out, 0, sizeof(out));
+  if (!e.is<JsonObjectConst>()) return "not a rule";
+  const char* s; size_t n;
+  if (!botCfgGetStr(e["kind"], 6, false, s, n)) return "kind must be \"exact\" or \"regex\"";
+  if (strcmp(s, "exact") == 0) out.kind = BMK_EXACT;
+  else if (strcmp(s, "regex") == 0) out.kind = BMK_REGEX;
+  else return "kind must be \"exact\" or \"regex\"";
+  if (!botCfgGetStr(e["text"], sizeof(out.text), false, s, n)) return "the text must be 1 to 48 bytes, without line breaks or tabs";
+  const char* why = botMatchTextError(out.kind, s);
+  if (why) return why;
+  memcpy(out.text, s, n);
+  if (!botCfgGetStr(e["run"], sizeof(out.run), false, s, n)) return "the command to run must be 1 to 48 bytes, without line breaks or tabs";
+  why = botMatchRunError(s);
+  if (why) return why;
+  memcpy(out.run, s, n);
+  if (!e["enabled"].isNull() && !e["enabled"].is<bool>()) return "enabled must be true or false";
+  out.enabled = e["enabled"].isNull() ? true : e["enabled"].as<bool>();
+  return nullptr;
+}
+
+// Checks a posted text-rule list on its own: at most BOT_MAX_MATCH elements, each valid. True
+// when it passes; else the first problem goes to err.
+static inline bool botMatchListCheck(JsonArrayConst arr, char* err, size_t cap) {
+  int pos = 0;
+  for (JsonVariantConst e : arr) {
+    pos++;
+    if (pos > BOT_MAX_MATCH) { snprintf(err, cap, "#%d: at most %d text rules", pos, BOT_MAX_MATCH); return false; }
+    BotMatchRule scratch;
+    const char* why = botMatchElemError(e, scratch);
+    if (why) { snprintf(err, cap, "#%d: %s", pos, why); return false; }
+  }
+  return true;
+}
+
 // Checks a posted watch list on its own: at most BOT_MAX_WATCH elements, each valid. True when
 // it passes; else the first problem goes to err.
 static inline bool botWatchListCheck(JsonArrayConst arr, char* err, size_t cap) {
@@ -483,7 +524,7 @@ static inline void botCfgResolveRenames(const BotConfig& c, const char want[BB_C
 // Shared loader. with_secrets=false never touches web_salt/web_hash. rep non-null selects the
 // strict web rules for the lists (see botConfigFromWebJsonStrict) and receives the reasons.
 static inline void botConfigApply(JsonVariantConst src, BotConfig& c, bool with_secrets, BotApplyReport* rep = nullptr) {
-  if (rep) { rep->custom[0] = '\0'; rep->builtin[0] = '\0'; rep->watch[0] = '\0'; rep->channels[0] = '\0'; }
+  if (rep) { rep->custom[0] = '\0'; rep->builtin[0] = '\0'; rep->watch[0] = '\0'; rep->channels[0] = '\0'; rep->match[0] = '\0'; }
   if (!src.is<JsonObjectConst>()) return;
   JsonObjectConst o = src.as<JsonObjectConst>();
   long long iv; double dv;
@@ -629,6 +670,23 @@ static inline void botConfigApply(JsonVariantConst src, BotConfig& c, bool with_
     c.num_custom = (uint8_t)n;
   }
 
+  // bare, and the text rules: the list replaces the stored one when it is an array (strict: only
+  // when every element is valid, else rep.match says why; lenient: invalid elements are skipped).
+  if (o["bare"].is<bool>()) c.bare = o["bare"].as<bool>();
+  if (o["match"].is<JsonArrayConst>()) {
+    JsonArrayConst ml = o["match"].as<JsonArrayConst>();
+    if (!rep || botMatchListCheck(ml, rep->match, sizeof(rep->match))) {
+      memset(c.match, 0, sizeof(c.match));
+      int n = 0;
+      for (JsonVariantConst e : ml) {
+        if (n >= BOT_MAX_MATCH) break;
+        if (botMatchElemError(e, c.match[n]) == nullptr) n++;
+        else memset(&c.match[n], 0, sizeof(c.match[n]));
+      }
+      c.num_match = (uint8_t)n;
+    }
+  }
+
   // watch: replaces the list when it is an array (strict: only when every element is valid, at
   // most BOT_MAX_WATCH). Lenient: invalid elements are skipped and the first four valid ones kept.
   if (o["watch"].is<JsonArrayConst>()) {
@@ -721,6 +779,15 @@ static inline void botConfigToJson(const BotConfig& c, JsonObject dst, bool for_
     e["path"] = (const char*)c.custom[i].path;
     e["cache_s"] = c.custom[i].cache_s;
   }
+  dst["bare"] = c.bare;
+  JsonArray ma = dst["match"].to<JsonArray>();
+  for (int i = 0; i < c.num_match && i < BOT_MAX_MATCH; i++) {
+    JsonObject e = ma.add<JsonObject>();
+    e["kind"] = c.match[i].kind == BMK_REGEX ? "regex" : "exact";
+    e["text"] = (const char*)c.match[i].text;
+    e["run"] = (const char*)c.match[i].run;
+    e["enabled"] = c.match[i].enabled;
+  }
   JsonArray wa = dst["watch"].to<JsonArray>();
   for (int i = 0; i < c.num_watch && i < BOT_MAX_WATCH; i++) {
     JsonObject e = wa.add<JsonObject>();
@@ -769,7 +836,7 @@ static inline bool botConfigToJsonChecked(const BotConfig& c, JsonDocument& doc,
 static inline bool botCfgWebKey(const char* k) {
   static const char* const KEYS[] = {"channels", "channel", "scope", "prefix", "cooldown_s", "max_per_min", "ignore", "lat", "lon",
                                      "tz", "help_link", "advert_zero_hop_min", "advert_flood_min", "builtin", "custom",
-                                     "watch", "watch_online_min", "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_user",
+                                     "bare", "match", "watch", "watch_online_min", "mqtt_enabled", "mqtt_host", "mqtt_port", "mqtt_user",
                                      "mqtt_pass", "mqtt_prefix", "mqtt_wait_s"};
   if (!k) return false;
   for (size_t i = 0; i < sizeof(KEYS) / sizeof(KEYS[0]); i++) if (strcmp(k, KEYS[i]) == 0) return true;
@@ -818,6 +885,19 @@ static inline bool botCfgKeySame(const char* k, const BotConfig& a, const BotCon
       const BotCustomCmd &x = a.custom[i], &y = b.custom[i];
       if (strcmp(x.trigger, y.trigger) != 0 || strcmp(x.reply, y.reply) != 0 || strcmp(x.desc, y.desc) != 0 ||
           x.enabled != y.enabled || strcmp(x.url, y.url) != 0 || strcmp(x.path, y.path) != 0 || x.cache_s != y.cache_s)
+        return false;
+    }
+    return true;
+  }
+  if (strcmp(k, "bare") == 0) return a.bare == b.bare;
+  if (strcmp(k, "match") == 0) {
+    int na = a.num_match < BOT_MAX_MATCH ? a.num_match : BOT_MAX_MATCH;
+    int nb = b.num_match < BOT_MAX_MATCH ? b.num_match : BOT_MAX_MATCH;
+    if (na != nb) return false;
+    for (int i = 0; i < na; i++) {
+      const BotMatchRule &x = a.match[i], &y = b.match[i];
+      if ((x.kind == BMK_REGEX) != (y.kind == BMK_REGEX) || x.enabled != y.enabled || strcmp(x.text, y.text) != 0 ||
+          strcmp(x.run, y.run) != 0)
         return false;
     }
     return true;
@@ -899,6 +979,22 @@ static inline bool botCfgPostedSame(const char* k, JsonVariantConst v, const Bot
     }
     return true;
   }
+  if (strcmp(k, "bare") == 0) return v == c.bare;
+  if (strcmp(k, "match") == 0) {
+    if (!v.is<JsonArrayConst>()) return false;
+    JsonArrayConst arr = v.as<JsonArrayConst>();
+    int n = c.num_match < BOT_MAX_MATCH ? c.num_match : BOT_MAX_MATCH;
+    if (arr.size() != (size_t)n) return false;
+    int i = 0;
+    for (JsonVariantConst e : arr) {
+      const BotMatchRule& x = c.match[i++];
+      if (!e.is<JsonObjectConst>() || e.size() != 4) return false;
+      if (!(e["kind"] == (x.kind == BMK_REGEX ? "regex" : "exact")) || !(e["text"] == (const char*)x.text) ||
+          !(e["run"] == (const char*)x.run) || !(e["enabled"] == x.enabled))
+        return false;
+    }
+    return true;
+  }
   if (strcmp(k, "watch") == 0) {
     if (!v.is<JsonArrayConst>()) return false;
     JsonArrayConst arr = v.as<JsonArrayConst>();
@@ -932,7 +1028,7 @@ static inline void botCfgRefusedKeys(JsonObjectConst posted, const BotConfig& be
     if (legacy && !posted["channels"].isNull()) continue;
     if (!botCfgWebKey(k) || !botCfgKeySame(k, before, after) || botCfgPostedSame(k, kv.value(), before)) continue;
     if ((rep.custom[0] && strcmp(k, "custom") == 0) || (rep.builtin[0] && strcmp(k, "builtin") == 0) ||
-        (rep.watch[0] && strcmp(k, "watch") == 0) || (rep.channels[0] && (legacy || strcmp(k, "channels") == 0)))
+        (rep.watch[0] && strcmp(k, "watch") == 0) || (rep.match[0] && strcmp(k, "match") == 0) || (rep.channels[0] && (legacy || strcmp(k, "channels") == 0)))
       continue;
     size_t n = strlen(out);
     snprintf(out + n, cap - n, "%s%s", n ? ", " : "", k);

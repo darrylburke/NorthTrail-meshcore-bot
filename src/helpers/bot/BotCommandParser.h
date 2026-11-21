@@ -8,8 +8,13 @@
 struct BotParsed {
   char cmd[17];      // lower-cased command word, letters and digits, up to 16 chars
   const char* args;  // points into the input; "" when none (callers trim trailing spaces)
-  bool prefixed;     // the command prefix was written (always true in a channel; a DM may omit it)
+  bool prefixed;     // the command prefix was written, or the bot treats the command as if it had been (a text rule's)
 };
+
+// Whether a command written without the prefix is taken: in a direct message always; in a channel
+// only when the owner allows it (bare) and the word is a command the bot can answer (known), so
+// ordinary chat is left alone and uses up nobody's cooldown.
+static inline bool botBareTaken(bool is_dm, bool bare, bool known) { return is_dm || (bare && known); }
 
 static inline bool botIsAlnum(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
