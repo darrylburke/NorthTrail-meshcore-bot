@@ -15,7 +15,7 @@ static const char BOT_WEB_HTML[] PROGMEM = R"HTML(<!doctype html>
 @media (prefers-color-scheme:dark){:root{--bg:#161715;--fg:#e9e9e4;--mut:#9a9a92;--card:#20211f;--line:#383935;--acc:#5fc2a6;--bad:#ff8a73;--ok:#7fd58c}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif}
-main{max-width:760px;margin:0 auto;padding:12px 16px 48px}
+main{max-width:max(760px,calc(50vw + 380px));margin:0 auto;padding:12px 16px 48px}
 h1{font-size:1.3em;margin:8px 0}
 h2{font-size:1.05em;margin:0 0 10px}
 h3{font-size:1em;margin:14px 0 6px}
