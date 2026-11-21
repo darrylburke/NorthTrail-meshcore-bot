@@ -264,6 +264,12 @@ TEST(Queue, DueSurvivesMillisWrap) {
   EXPECT_NE(q.due(due + 10), nullptr);
 }
 
+TEST(PingParts, SeveralOnlyWhenNothingElseIsQueued) {
+  EXPECT_EQ(botPingPartsAllowed(0), BOT_PING_PARTS_MAX);
+  for (int q = 1; q <= (int)BotReplyQueue::SLOTS; q++) EXPECT_EQ(botPingPartsAllowed(q), 1);
+  EXPECT_LT(BOT_PING_PARTS_MAX, (int)BotReplyQueue::SLOTS);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

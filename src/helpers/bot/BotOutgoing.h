@@ -13,6 +13,7 @@
 #define BOT_MENTION_MIN_BODY 24         // reply bytes kept beside a very long sender name
 #define BOT_REPLY_DELAY_MS 1500u        // a reply waits this long after the request
 #define BOT_PART_GAP_MS 4000u           // between the messages of one multi-message broker reply
+#define BOT_PING_PARTS_MAX 3            // a ping's route may take this many messages (one queue slot stays free)
 #define BOT_KEY_BYTES 32                // a contact's public key
 
 // Bytes a reply may use: BOT_MAX_MSG minus "<node_name>: ". 0 when the name leaves no room.
@@ -102,6 +103,10 @@ static inline size_t botFinishReply(char* dst, size_t cap, const char* reply, co
   return pos + body;
 }
 
+// How many messages a ping may take: several only when no other reply is waiting to go out, so
+// a long route never delays or pushes out an answer to someone else; otherwise one, cut "+N more".
+static inline uint8_t botPingPartsAllowed(int queued) { return queued == 0 ? BOT_PING_PARTS_MAX : 1; }
+
 // ---- deferred replies ----
 
 // Where a reply goes: a channel by name, a contact by public key, or (BD_TRY) back to the web
@@ -162,5 +167,6 @@ public:
 
 private:
   BotQueuedReply _q[SLOTS];
+  static_assert(BOT_PING_PARTS_MAX < SLOTS, "a ping leaves a queue slot free");
   int _head, _count;
 };

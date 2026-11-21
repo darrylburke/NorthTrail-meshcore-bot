@@ -432,7 +432,19 @@ void BotTask::process(const BotParsed& p, const BotMsgInfo& m, const BotReplyDes
   }
   // A custom command's reply is its template filled in (a stranger's {args} among it): never taken
   // as the bot's own mention.
-  deliver(dest, _built, custom >= 0 ? BRT_FOREIGN : BRT_BUILTIN, sender, body, now_ms, botCapAtDelivery(BRO_LOCAL));
+  bool capped = false;
+  deliver(dest, _built, custom >= 0 ? BRT_FOREIGN : BRT_BUILTIN, sender, body, now_ms, botCapAtDelivery(BRO_LOCAL), &capped);
+  // A ping whose route did not fit one message, built while nothing else was queued: the rest follows, BOT_PART_GAP_MS apart, each
+  // message counted against the cap and the remainder dropped once one is refused. (A try has
+  // no route.)
+  if (builtin == BB_PING && dest.kind != BD_TRY) {
+    uint8_t parts = _ping_parts;
+    for (uint8_t k = 1; k < parts && !capped; k++) {
+      botFmtPingPart(_built, sizeof(_built), m, lookupPathName, this, max_bytes, k, _ping_max, nullptr);
+      deliver(dest, _built, BRT_BUILTIN, sender, body, now_ms, botCapAtDelivery(BRO_LOCAL), &capped, false,
+              (uint32_t)k * BOT_PART_GAP_MS);
+    }
+  }
 }
 
 void BotTask::deliver(const BotReplyDest& dest, const char* body_text, uint8_t source, const char* sender, const char* request,
@@ -694,7 +706,10 @@ bool BotTask::buildReply(int builtin, int custom, const BotParsed& p, const BotM
     botRender(_tmp, sizeof(_tmp), _cfg.custom[custom].reply, v);
   } else {
     switch (builtin) {
-      case BB_PING:  botFmtPingPath(_tmp, sizeof(_tmp), m, lookupPathName, this, max_bytes); break;
+      case BB_PING:
+        _ping_max = botPingPartsAllowed(_outq.size());
+        botFmtPingPart(_tmp, sizeof(_tmp), m, lookupPathName, this, max_bytes, 0, _ping_max, &_ping_parts);
+        break;
       case BB_TEST:  botFmtTest(_tmp, sizeof(_tmp), m); break;
       case BB_PATH:  botFmtPath(_tmp, sizeof(_tmp), m, lookupPathName, this); break;
       case BB_HELP:  return buildHelp(_args, out, out_cap, body_max) > 0;               // pages fit by design

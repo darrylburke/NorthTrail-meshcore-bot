@@ -184,6 +184,8 @@ private:
   char _reply[128];   // the on-air text
   char _tmp[208];     // also a broker reply's text (up to 200 bytes)
   char _args[160];
+  uint8_t _ping_max;     // messages that ping was allowed (botPingPartsAllowed)
+  uint8_t _ping_parts;   // messages the ping reply just built takes (its route may need several)
   char _line[128];    // the command line a text rule stands for
   char _path_hex[96];
   char _var_time[16], _var_date[24], _var_uptime[24];   // {time} {date} {uptime}

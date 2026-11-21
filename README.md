@@ -145,8 +145,11 @@ There is no default password.
 Notes:
 
 - `ping` lists each repeater as `a53e: Name`, or `a53e: ?` when the bot has no name for it.
-  Only whole lines are sent; when a long route does not fit one message the last line says how
-  many are left out (`+12 more`). A direct or zero-hop message has no list.
+  Only whole lines are sent. A route that does not fit one message carries on in further
+  messages (`route, part 2` and so on, about 4 seconds apart, up to three in all, each counted
+  against the per-minute cap). That happens only when no other reply is waiting to go out;
+  otherwise, and for a route too long even for three messages, the last line reads `+N more`. A direct or
+  zero-hop message has no list.
 - `heard` and `mesh` use counters kept in memory; they start again after a reboot.
 - `dist` needs your position. In a direct message the bot uses your contact's advertised position.
   On a channel it matches your name against its contacts, and says the position is unknown when

@@ -46,6 +46,43 @@ TEST(Fmt, PingPathKeepsWholeLinesAndCountsTheRest) {
   EXPECT_EQ(std::string(big).size(), 208u);
   EXPECT_EQ(std::string(big).substr(201), "3c3d: ?");   // all 23 fit in exactly 208
 }
+TEST(Fmt, PingRouteCarriesOnInFurtherMessages) {
+  static uint8_t path[64]; for (int i=0;i<64;i++) path[i]=(uint8_t)(0x10+i);
+  auto nm = [](const uint8_t* h,uint8_t,void*)->const char*{ return (h[0]&2) ? "A Fairly Long Repeater Name" : nullptr; };
+  for (int hs = 1; hs <= 3; hs++) for (int hops = 0; hops <= 64/hs; hops++) for (size_t limit : {40u, 60u, 110u, 125u}) {
+    BotMsgInfo m = {"Dee",(uint8_t)hops,(uint8_t)hs,path,-4.5f,-98,false};
+    char b[128]; uint8_t parts = 0;
+    botFmtPingPart(b,sizeof b,m,nm,nullptr,limit,0,4,&parts);
+    ASSERT_GE(parts,1); ASSERT_LE(parts,4);
+    int shown = 0, more = 0;
+    for (uint8_t k = 0; k < parts; k++) {
+      uint8_t again = 0;
+      size_t n = botFmtPingPart(b,sizeof b,m,nm,nullptr,limit,k,4,&again);
+      ASSERT_EQ(again, parts); ASSERT_EQ(n, strlen(b)); ASSERT_LE(n, limit); ASSERT_GT(n, 0u);
+      std::string s(b);
+      if (k) ASSERT_EQ(s.rfind("@[Dee] route, part " + std::to_string(k+1), 0), 0u) << s;
+      else ASSERT_EQ(s.rfind("@[Dee] ", 0), 0u);
+      size_t pos = s.find('\n');
+      while (pos != std::string::npos) {
+        size_t end = s.find('\n', pos + 1);
+        std::string line = s.substr(pos + 1, end == std::string::npos ? std::string::npos : end - pos - 1);
+        if (line[0] == '+' ) { more = atoi(line.c_str()+1); ASSERT_EQ(end, std::string::npos); ASSERT_EQ(k, parts-1); }
+        else { ASSERT_EQ(line.substr((size_t)hs*2, 2), ": "); shown++; }
+        pos = end;
+      }
+      if (k + 1 < parts) ASSERT_EQ(more, 0);
+    }
+    ASSERT_EQ(shown + more, hops) << hs << " " << hops << " " << limit;
+    if (parts < 4 && limit >= 110) ASSERT_EQ(more, 0);   // a real message always has room for a line
+    EXPECT_EQ(botFmtPingPart(b,sizeof b,m,nm,nullptr,limit,parts,4,nullptr), 0u); EXPECT_STREQ(b,"");
+  }
+  BotMsgInfo m = {"Dee",6,3,path,12.0f,-98,false};
+  char b[128]; uint8_t parts;
+  botFmtPingPart(b,sizeof b,m,nullptr,nullptr,60,0,4,&parts); EXPECT_EQ(parts,2);
+  EXPECT_STREQ(b,"@[Dee] 6 hops, SNR 12\n101112: ?\n131415: ?\n161718: ?");
+  botFmtPingPart(b,sizeof b,m,nullptr,nullptr,60,1,4,&parts);
+  EXPECT_STREQ(b,"@[Dee] route, part 2\n191a1b: ?\n1c1d1e: ?\n1f2021: ?");
+}
 TEST(Fmt, PingSingular)  { char b[128]; botFmtPing(b,128,M(1)); EXPECT_STREQ(b,"@[Dee] 1 hop, SNR 7.5"); }
 TEST(Fmt, SnrTrimmed)    { char b[128]; BotMsgInfo m=M(2); m.snr=-7.0f; botFmtPing(b,128,m); EXPECT_STREQ(b,"@[Dee] 2 hops, SNR -7"); m.snr=11.25f; botFmtPing(b,128,m); EXPECT_STREQ(b,"@[Dee] 2 hops, SNR 11.25"); }
 TEST(Fmt, Test)          { char b[128]; botFmtTest(b,128,M(2)); EXPECT_STREQ(b,"@[Dee] ack | a53e96,bcadb8 (2 hops) | SNR 7.5 | RSSI -98"); }

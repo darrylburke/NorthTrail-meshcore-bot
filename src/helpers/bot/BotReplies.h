@@ -130,34 +130,73 @@ static inline size_t botFmtPing(char* dst, size_t cap, const BotMsgInfo& m) {
 // The ping reply followed by the route the message took, one repeater to a line:
 //   "@[Dee] 3 hops, SNR 7.5\na53e: Vincent Repeater\nbcad: ?\n07f2: Hilltop"
 // "?" stands for a repeater the node has no name for (fn null or returning none). Only whole
-// lines are written; when the reply (at most limit bytes, and cap - 1) cannot hold them all, the
-// last line says how many are left out: "+4 more". A direct or zero-hop message has no lines.
-static inline size_t botFmtPingPath(char* dst, size_t cap, const BotMsgInfo& m, BotNameLookup fn, void* ctx, size_t limit) {
-  size_t n = botFmtPing(dst, cap, m);
-  if (!dst || cap == 0 || botPathUnknown(m)) return n;
+// lines are written. A route too long for one message (limit bytes, and cap - 1) carries on in
+// further messages, each beginning "@[Dee] route, part 2" and so on, up to max_parts messages in
+// all; only when even those cannot hold it does the last one end "+4 more". A direct or zero-hop
+// message has no lines. Writes message number part (from 0) to dst and returns its length; *parts
+// (when given) receives how many messages the whole reply takes. A part past the last writes "".
+static inline size_t botFmtPingPart(char* dst, size_t cap, const BotMsgInfo& m, BotNameLookup fn, void* ctx, size_t limit,
+                                    uint8_t part, uint8_t max_parts, uint8_t* parts) {
+  if (parts) *parts = 1;
+  if (!dst || cap == 0) return 0;
+  dst[0] = '\0';
+  if (max_parts < 1) max_parts = 1;
   if (limit > cap - 1) limit = cap - 1;
-  for (uint8_t i = 0; i < m.hops; i++) {
-    const uint8_t* h = m.path + (size_t)i * m.hash_size;
-    char line[48];
-    BotOut o = botOutInit(line, sizeof(line));
-    botOutAppend(o, "\n");
-    botOutHash(o, h, m.hash_size, false);
-    botOutAppend(o, ": ");
-    const char* name = fn ? fn(h, m.hash_size, ctx) : nullptr;
-    botOutAppend(o, (name && *name) ? name : "?");
-    unsigned left = (unsigned)(m.hops - i - 1);
-    char more[16] = "";
-    if (left) snprintf(more, sizeof(more), "\n+%u more", left);
-    if (n + o.n + strlen(more) > limit) {   // this line and a note for the rest do not both fit
-      snprintf(more, sizeof(more), "\n+%u more", left + 1);
-      size_t ml = strlen(more);
-      if (n + ml <= limit) { memcpy(dst + n, more, ml + 1); n += ml; }
-      break;
+  size_t out_n = 0;
+  uint8_t hop = 0, p = 0;
+  bool unknown = botPathUnknown(m);
+  for (;; p++) {
+    bool mine = p == part;
+    // The head of this message: written for real only when it is the one asked for.
+    char head[96];
+    size_t n;
+    if (p == 0) {
+      n = botFmtPing(mine ? dst : head, mine ? cap : sizeof(head), m);
+    } else {
+      BotOut o = botOutInit(mine ? dst : head, mine ? cap : sizeof(head));
+      botOutMention(o, m.sender);
+      botOutAppend(o, " route, part ");
+      botOutInt(o, (long)p + 1);
+      n = o.n;
     }
-    memcpy(dst + n, line, o.n + 1);
-    n += o.n;
+    bool last = p + 1 >= max_parts;
+    uint8_t took = 0;
+    while (!unknown && hop < m.hops) {
+      const uint8_t* h = m.path + (size_t)hop * m.hash_size;
+      char line[48];
+      BotOut o = botOutInit(line, sizeof(line));
+      botOutAppend(o, "\n");
+      botOutHash(o, h, m.hash_size, false);
+      botOutAppend(o, ": ");
+      const char* name = fn ? fn(h, m.hash_size, ctx) : nullptr;
+      botOutAppend(o, (name && *name) ? name : "?");
+      unsigned left = (unsigned)(m.hops - hop - 1);
+      char more[16] = "";
+      if (last && left) snprintf(more, sizeof(more), "\n+%u more", left);   // room kept for the note
+      if (n + o.n + strlen(more) > limit) {
+        if (!last && took > 0) break;   // carries on in the next message
+        // The last message, or one too small for even a single line: say how many are left out.
+        snprintf(more, sizeof(more), "\n+%u more", left + 1);
+        size_t ml = strlen(more);
+        if (n + ml <= limit) { if (mine) memcpy(dst + n, more, ml + 1); n += ml; }
+        hop = m.hops;
+        break;
+      }
+      if (mine) memcpy(dst + n, line, o.n + 1);
+      n += o.n;
+      hop++;
+      took++;
+    }
+    if (mine) out_n = n;
+    if (unknown || hop >= m.hops) break;
   }
-  return n;
+  if (parts) *parts = (uint8_t)(p + 1);
+  return out_n;
+}
+
+// The whole reply in one message: what does not fit is counted in a last "+N more" line.
+static inline size_t botFmtPingPath(char* dst, size_t cap, const BotMsgInfo& m, BotNameLookup fn, void* ctx, size_t limit) {
+  return botFmtPingPart(dst, cap, m, fn, ctx, limit, 0, 1, nullptr);
 }
 
 // "@[Dee] ack | a53e96,bcadb8 (2 hops) | SNR 7.5 | RSSI -98"; "Direct" has no hop count.
