@@ -135,8 +135,10 @@ static inline size_t botFmtPing(char* dst, size_t cap, const BotMsgInfo& m) {
 // all; only when even those cannot hold it does the last one end "+4 more". A direct or zero-hop
 // message has no lines. Writes message number part (from 0) to dst and returns its length; *parts
 // (when given) receives how many messages the whole reply takes. A part past the last writes "".
-static inline size_t botFmtPingPart(char* dst, size_t cap, const BotMsgInfo& m, BotNameLookup fn, void* ctx, size_t limit,
-                                    uint8_t part, uint8_t max_parts, uint8_t* parts) {
+// As a path reply (path true) the first message begins "@[Dee] path, 3 hops" (or is just
+// "@[Dee] Direct") and the hashes are upper-case, as that command has always shown them.
+static inline size_t botFmtRoutePart(char* dst, size_t cap, const BotMsgInfo& m, BotNameLookup fn, void* ctx, size_t limit,
+                                     uint8_t part, uint8_t max_parts, uint8_t* parts, bool path) {
   if (parts) *parts = 1;
   if (!dst || cap == 0) return 0;
   dst[0] = '\0';
@@ -150,8 +152,14 @@ static inline size_t botFmtPingPart(char* dst, size_t cap, const BotMsgInfo& m, 
     // The head of this message: written for real only when it is the one asked for.
     char head[96];
     size_t n;
-    if (p == 0) {
+    if (p == 0 && !path) {
       n = botFmtPing(mine ? dst : head, mine ? cap : sizeof(head), m);
+    } else if (p == 0) {
+      BotOut o = botOutInit(mine ? dst : head, mine ? cap : sizeof(head));
+      botOutMention(o, m.sender);
+      if (unknown) botOutAppend(o, " Direct");
+      else { botOutAppend(o, " path, "); botOutHops(o, m.hops); }
+      n = o.n;
     } else {
       BotOut o = botOutInit(mine ? dst : head, mine ? cap : sizeof(head));
       botOutMention(o, m.sender);
@@ -166,7 +174,7 @@ static inline size_t botFmtPingPart(char* dst, size_t cap, const BotMsgInfo& m, 
       char line[48];
       BotOut o = botOutInit(line, sizeof(line));
       botOutAppend(o, "\n");
-      botOutHash(o, h, m.hash_size, false);
+      botOutHash(o, h, m.hash_size, path);
       botOutAppend(o, ": ");
       const char* name = fn ? fn(h, m.hash_size, ctx) : nullptr;
       botOutAppend(o, (name && *name) ? name : "?");
@@ -192,6 +200,11 @@ static inline size_t botFmtPingPart(char* dst, size_t cap, const BotMsgInfo& m, 
   }
   if (parts) *parts = (uint8_t)(p + 1);
   return out_n;
+}
+
+static inline size_t botFmtPingPart(char* dst, size_t cap, const BotMsgInfo& m, BotNameLookup fn, void* ctx, size_t limit,
+                                    uint8_t part, uint8_t max_parts, uint8_t* parts) {
+  return botFmtRoutePart(dst, cap, m, fn, ctx, limit, part, max_parts, parts, false);
 }
 
 // The whole reply in one message: what does not fit is counted in a last "+N more" line.

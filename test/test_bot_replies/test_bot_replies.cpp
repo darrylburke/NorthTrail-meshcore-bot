@@ -83,6 +83,14 @@ TEST(Fmt, PingRouteCarriesOnInFurtherMessages) {
   botFmtPingPart(b,sizeof b,m,nullptr,nullptr,60,1,4,&parts);
   EXPECT_STREQ(b,"@[Dee] route, part 2\n191a1b: ?\n1c1d1e: ?\n1f2021: ?");
 }
+TEST(Fmt, PathListsOneRepeaterToALine) {
+  char b[128]; uint8_t parts = 0;
+  size_t n = botFmtRoutePart(b,128,M(2),look,nullptr,110,0,3,&parts,true);
+  EXPECT_STREQ(b,"@[Dee] path, 2 hops\nA53E96: Vincent Repeater\nBCADB8: ?"); EXPECT_EQ(n, strlen(b)); EXPECT_EQ(parts,1);
+  BotMsgInfo d=M(2); d.direct=true; botFmtRoutePart(b,128,d,look,nullptr,110,0,3,&parts,true); EXPECT_STREQ(b,"@[Dee] Direct"); EXPECT_EQ(parts,1);
+  botFmtRoutePart(b,128,M(3),nullptr,nullptr,40,0,3,&parts,true); EXPECT_STREQ(b,"@[Dee] path, 3 hops\nA53E96: ?\nBCADB8: ?"); EXPECT_EQ(parts,2);
+  botFmtRoutePart(b,128,M(3),nullptr,nullptr,40,1,3,&parts,true); EXPECT_STREQ(b,"@[Dee] route, part 2\n010203: ?");
+}
 TEST(Fmt, PingSingular)  { char b[128]; botFmtPing(b,128,M(1)); EXPECT_STREQ(b,"@[Dee] 1 hop, SNR 7.5"); }
 TEST(Fmt, SnrTrimmed)    { char b[128]; BotMsgInfo m=M(2); m.snr=-7.0f; botFmtPing(b,128,m); EXPECT_STREQ(b,"@[Dee] 2 hops, SNR -7"); m.snr=11.25f; botFmtPing(b,128,m); EXPECT_STREQ(b,"@[Dee] 2 hops, SNR 11.25"); }
 TEST(Fmt, Test)          { char b[128]; botFmtTest(b,128,M(2)); EXPECT_STREQ(b,"@[Dee] ack | a53e96,bcadb8 (2 hops) | SNR 7.5 | RSSI -98"); }

@@ -131,7 +131,7 @@ There is no default password.
 |---|---|---|
 | `ping` | Hop count and signal of your message, then the route it took: one repeater to a line, by name where known | no |
 | `test` | Path, SNR and RSSI of your message | no |
-| `path` | The repeaters your message came through, by name where known | no |
+| `path` | The repeaters your message came through, one to a line, by name where known | no |
 | `help` | The command list and the help link; `help 2` continues; `help <command>` gives one line | no |
 | `heard` | Nodes heard in the last 24 hours | no |
 | `mesh` | Traffic summary for the last hour | no |
@@ -146,6 +146,8 @@ There is no default password.
 
 Notes:
 
+- `path` lists the route the same way as `ping` (hashes in capitals), under `path, 3 hops`, and
+  carries on in further messages by the same rule.
 - `ping` lists each repeater as `a53e: Name`, or `a53e: ?` when the bot has no name for it.
   Only whole lines are sent. A route that does not fit one message carries on in further
   messages (`route, part 2` and so on, about 4 seconds apart, up to three in all, each counted

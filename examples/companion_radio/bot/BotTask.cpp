@@ -438,13 +438,13 @@ void BotTask::process(const BotParsed& p, const BotMsgInfo& m, const BotReplyDes
   // as the bot's own mention.
   bool capped = false;
   deliver(dest, _built, custom >= 0 ? BRT_FOREIGN : BRT_BUILTIN, sender, body, now_ms, botCapAtDelivery(BRO_LOCAL), &capped);
-  // A ping whose route did not fit one message, built while nothing else was queued: the rest follows, BOT_PART_GAP_MS apart, each
+  // A ping or path whose route did not fit one message, built while nothing else was queued: the rest follows, BOT_PART_GAP_MS apart, each
   // message counted against the cap and the remainder dropped once one is refused. (A try has
   // no route.)
-  if (builtin == BB_PING && dest.kind != BD_TRY) {
+  if ((builtin == BB_PING || builtin == BB_PATH) && dest.kind != BD_TRY) {
     uint8_t parts = _ping_parts;
     for (uint8_t k = 1; k < parts && !capped; k++) {
-      botFmtPingPart(_built, sizeof(_built), m, lookupPathName, this, max_bytes, k, _ping_max, nullptr);
+      botFmtRoutePart(_built, sizeof(_built), m, lookupPathName, this, max_bytes, k, _ping_max, nullptr, builtin == BB_PATH);
       deliver(dest, _built, BRT_BUILTIN, sender, body, now_ms, botCapAtDelivery(BRO_LOCAL), &capped, false,
               (uint32_t)k * BOT_PART_GAP_MS);
     }
@@ -715,7 +715,10 @@ bool BotTask::buildReply(int builtin, int custom, const BotParsed& p, const BotM
         botFmtPingPart(_tmp, sizeof(_tmp), m, lookupPathName, this, max_bytes, 0, _ping_max, &_ping_parts);
         break;
       case BB_TEST:  botFmtTest(_tmp, sizeof(_tmp), m); break;
-      case BB_PATH:  botFmtPath(_tmp, sizeof(_tmp), m, lookupPathName, this); break;
+      case BB_PATH:
+        _ping_max = botPingPartsAllowed(_outq.size());
+        botFmtRoutePart(_tmp, sizeof(_tmp), m, lookupPathName, this, max_bytes, 0, _ping_max, &_ping_parts, true);
+        break;
       case BB_HELP:  return buildHelp(_args, out, out_cap, body_max) > 0;               // pages fit by design
       case BB_HEARD: return _heard.format(out, out_cap, uptimeSeconds(), body_max) > 0;   // whole names only
       case BB_MESH: {
